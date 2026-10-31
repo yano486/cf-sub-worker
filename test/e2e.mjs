@@ -93,7 +93,10 @@ try {
     delOwn(k); await __until(__top); await __ok(); await __until(() => document.querySelectorAll('.uplist.own .up').length === 3)
     return { '链接解析填表': filled, '保存后多一行': !!k, '删除后恢复': document.querySelectorAll('.uplist.own .up').length === 3 }`)
   await step('自有节点：WebSocket 传输切换表单字段并能保存', `editOwn(null); await __until(__top); const m = __top()
+    m.querySelector('#osecurity .selb').click(); await __w(50); document.querySelector('.selp.portal .selo[data-v="tls"]').click(); await __w(50)
     m.querySelector('#onet .selb').click(); await __w(50); document.querySelector('.selp.portal .selo[data-v="ws"]').click(); await __w(50)
+    m.querySelector('#ownadvanced').open = true
+    m.querySelector('#oflow .selb').click(); await __w(50); document.querySelector('.selp.portal .selo[data-v=""]').click(); await __w(50)
     const swapped = m.querySelector('#fr').hidden && !m.querySelector('#fw').hidden
     m.querySelector('#on').value = 'E2E-WS'; m.querySelector('#os').value = 'cdn.e2e.example'; m.querySelector('#ou').value = '11111111-2222-3333-4444-555555555555'
     m.querySelector('#osni').value = 'cdn.e2e.example'; m.querySelector('#opath').value = '/ws'
@@ -102,6 +105,16 @@ try {
     const label = /VLESS WS/.test(document.querySelector('.uplist.own').textContent)
     delOwn(k); await __until(__top); await __ok(); await __until(() => document.querySelectorAll('.uplist.own .up').length === 3)
     return { '选 WebSocket 后显示路径而不是 Reality 公钥': swapped, '按 ws 保存': n.net === 'ws' && n.path === '/ws' && !n.pk, '列表里显示为 VLESS WS': label }`)
+  await step('自有节点：输入框对齐与主题勾选项', `editOwn(null); await __until(__top); const m = __top()
+    const a = m.querySelector('#os').getBoundingClientRect(), p = m.querySelector('#op').getBoundingClientRect()
+    m.querySelector('#ownadvanced').open = true
+    const input = m.querySelector('#oudp'), label = input.closest('label'), box = input.nextElementSibling
+    const was = input.checked; label.querySelector('span:last-child').click()
+    const toggled = input.checked !== was; label.querySelector('span:last-child').click()
+    const css = getComputedStyle(box), display = getComputedStyle(label).display
+    const sameSize = css.width === '18px' && css.height === '18px'
+    await __close()
+    return { '顶部和底部对齐': Math.abs(a.top - p.top) < 1 && Math.abs(a.bottom - p.bottom) < 1, '端口定宽': Math.abs(p.width - 112) < 1, '点击文字改变真实勾选状态': toggled && input.checked === was, '统一勾选尺寸': sameSize, '标签使用行布局': display === 'flex' }`)
   await step('自有节点表单校验', `editOwn(null); await __until(__top); const m = __top(); m.querySelector('#on').value = 'x'; m.querySelector('#os').value = 'a.example'; m.querySelector('#op').value = '99999'
     await __ok(); const e = (m.querySelector('.ferr') || {}).textContent || ''; await __close(); return /1-65535/.test(e)`)
   await step('链式代理编辑弹窗', `editChain('c1'); await __until(__top); const t = __top().textContent; await __close(); return /中转/.test(t) && /落地/.test(t)`)
@@ -231,6 +244,10 @@ try {
     await step(`「${t}」页不横向溢出`, `return document.documentElement.scrollWidth <= innerWidth + 1 || document.documentElement.scrollWidth + ' > ' + innerWidth`)
   }
   await step('弹窗在窄屏是底部抽屉', `editSettings(); await __until(__top); const r = __top().getBoundingClientRect(); await __close(); return Math.abs(r.bottom - innerHeight) < 2`)
+  await step('新建节点窄屏字段堆叠且不溢出', `editOwn(null); await __until(__top); const m = __top(), ct = m.querySelector('.ct')
+    const a = m.querySelector('#os').getBoundingClientRect(), p = m.querySelector('#op').getBoundingClientRect()
+    const overflow = ct.scrollWidth > ct.clientWidth + 1
+    await __close(); return { '地址端口上下排列': p.top >= a.bottom, '左右同宽': Math.abs(a.width - p.width) < 1 && Math.abs(a.left - p.left) < 1, '没有横向滚动': !overflow }`)
 
   sec('暗色')
   await page('node', { dark: true })

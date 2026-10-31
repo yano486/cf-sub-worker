@@ -590,7 +590,9 @@ const DEFAULT_PROFILES = [{
 
 async function loadProfiles() {
   const ps = await kvGet('profiles', null)
-  return Array.isArray(ps) && ps.length ? ps : DEFAULT_PROFILES
+  if (ps === null) return DEFAULT_PROFILES
+  if (!Array.isArray(ps) || !ps.length) throw new SecurityStateError()
+  return ps
 }
 // 「重置订阅」用的默认档案，token 一律新生成。沿用 SETUP_TOKEN 的话，管理员之前因泄露
 // 换掉的那个地址（默认订阅的 token 就是它，deploy.sh 还把它打印在终端上）会重新生效
@@ -691,12 +693,25 @@ function profilePolicies(prof, globalPolicies) {
 
 // ---------- KV 封装 ----------
 
+class SecurityStateError extends Error {
+  constructor() { super('安全配置暂时不可用，请稍后重试') }
+}
+const SECURITY_KEYS = new Set(['auth:password', 'auth:secret', 'profiles'])
+
 async function kvGet(key, def) {
-  if (!hasKV) return def
+  if (!hasKV) {
+    if (SECURITY_KEYS.has(key)) throw new SecurityStateError()
+    return def
+  }
   try {
     const v = await CONF.get(key, 'json')
+    if ((key === 'auth:password' || key === 'auth:secret') && v !== null && v !== undefined && (typeof v !== 'string' || !v)) throw new SecurityStateError()
     return v === null || v === undefined ? def : v
-  } catch (e) { return def }
+  } catch (e) {
+    // 认证和授权读取失败不等于键不存在，不能触发初始化或恢复默认权限。
+    if (SECURITY_KEYS.has(key)) throw new SecurityStateError()
+    return def
+  }
 }
 
 async function kvPut(key, val) {
@@ -819,6 +834,7 @@ async function loginGate(req) {
     if (used) return 0
     used = true
     PENDING.set(k, Math.max(0, (PENDING.get(k) || 1) - 1))
+    if (ok === undefined) return LOGIN_MAX_FAIL - (r ? r.n : 0)
     if (ok) {
       if (FAILS.delete(k) || r) { if (typeof caches !== 'undefined') try { await caches.default.delete(guardKey(req, k)) } catch (e) {} }
       return LOGIN_MAX_FAIL
@@ -877,8 +893,12 @@ async function checkCookie(req) {
   if (!payload || !sig) return false
   if (!(Number(payload) > Date.now())) return false
   try {
-    return safeEq(sig, await hmac(await sessionSecret(), payload))
-  } catch (e) { return false }
+    const secret = await kvGet('auth:secret', null)
+    return secret ? safeEq(sig, await hmac(secret, payload)) : false
+  } catch (e) {
+    if (e instanceof SecurityStateError) throw e
+    return false
+  }
 }
 
 // ---------- 上游订阅解析 ----------
@@ -1003,18 +1023,23 @@ function bareHost(h) {
   return (h.startsWith('[') && h.endsWith(']')) ? h.slice(1, -1) : h
 }
 
+// 与 Xray WebSocket GetNormalizedPath 一致：空路径为 /，缺少前导 / 时补齐。
+function normalizeWsPath(value) {
+  const path = String(value ?? '')
+  return path.startsWith('/') ? path : '/' + path
+}
+
 // 分享链接的传输层参数 → Clash 的 network 与各 *-opts
 function shareTransport(kv, q) {
-  const net = String(q.type || q.net || 'tcp').toLowerCase()
-  // URLSearchParams 已经解过一次码。有的生成器会把 path 再编码一层，所以这里仍解一次，
-  // 但必须用 safeDecode：`path=%2F100%25` 解一次是 `/100%`，再 decodeURIComponent 就抛异常，
-  // 以前这一条异常能把整个机场的解析一起带崩。
-  const path = q.path ? safeDecode(q.path) : ''
+  const rawNet = String(q.type || q.net || 'tcp').toLowerCase()
+  const net = ({ raw:'tcp', websocket:'ws', splithttp:'xhttp' })[rawNet] || rawNet
+  // URLSearchParams 已解码；VMess JSON 也直接传原值，避免把路径内的 %26 等再次展开。
+  const path = String(q.path || '')
   const host = String(q.host || '')
   const hosts = host.split(',').map(s => s.trim()).filter(Boolean)
   if (net === 'ws') {
     kv.network = 'ws'
-    kv['ws-opts'] = nestFlow({ path: yq(path || '/'), headers: host ? { Host: yq(host) } : '' })
+    kv['ws-opts'] = nestFlow({ path: yq(normalizeWsPath(path)), headers: host ? { Host: yq(host) } : '' })
   } else if (net === 'httpupgrade') {
     // mihomo 没有单独的 httpupgrade，是 ws 加一个开关；丢了开关就是按 ws 握手，连不上
     kv.network = 'ws'
@@ -1050,8 +1075,10 @@ function shareTLS(kv, q, sniKey) {
   if (q.fp) kv['client-fingerprint'] = yq(q.fp)
   const alpn = q.alpn ? safeDecode(q.alpn).split(',').map(s => s.trim()).filter(Boolean) : []
   if (alpn.length) kv.alpn = yqList(alpn)
-  if (q.insecure === '1' || q.insecure === 'true' || q.allowInsecure === '1' || q.allowInsecure === 'true')
+  if ([q.insecure,q.allowInsecure,q.allow_insecure,q['skip-cert-verify']].some(x => x === '1' || x === 'true'))
     kv['skip-cert-verify'] = 'true'
+  if (q.vcn || q.verifyName) kv['name-cert-verify'] = yq(q.vcn || q.verifyName)
+  if (q.pcs || q.pinSHA256) kv.fingerprint = yq(q.pcs || q.pinSHA256)
   if (sec === 'reality') {
     const r = nestFlow({ 'public-key': yqOpt(q.pbk), 'short-id': yqOpt(q.sid) })
     if (r) kv['reality-opts'] = r
@@ -1107,16 +1134,18 @@ function ssPlugin(str) {
   if (name === 'obfs-local' || name === 'simple-obfs' || name === 'obfs') {
     const mode = String(o.obfs || 'http').toLowerCase()
     if (mode !== 'http' && mode !== 'tls') return null
-    return { plugin: 'obfs', opts: nestFlow({ mode: yq(mode), host: yqOpt(o['obfs-host']) }) }
+    const extra = Object.fromEntries(Object.entries(o).filter(([k]) => !['obfs', 'obfs-host'].includes(k)))
+    return { plugin: 'obfs', opts: nestFlow({ mode: yq(mode), host: yqOpt(o['obfs-host']) }), unsupported: Object.keys(extra), extra }
   }
   if (name === 'v2ray-plugin') {
     // mihomo 的 v2ray-plugin 只有 websocket 模式
     if (String(o.mode || 'websocket').toLowerCase() !== 'websocket') return null
     const flag = k => k in o && !/^(0|false)$/i.test(o[k])
+    const extra = Object.fromEntries(Object.entries(o).filter(([k]) => !['mode', 'tls', 'host', 'path', 'mux'].includes(k)))
     return { plugin: 'v2ray-plugin', opts: nestFlow({
       mode: yq('websocket'), tls: flag('tls'), host: yqOpt(o.host), path: yqOpt(o.path),
       mux: flag('mux') && (o.mux === '' || Number(o.mux) > 0)
-    }) }
+    }), unsupported: Object.keys(extra), extra }
   }
   return null
 }
@@ -1159,8 +1188,8 @@ function parseShareLineRaw(line) {
       let j = null
       try { j = JSON.parse(b64decode(safeDecode(body.split('#')[0]))) } catch (e) { return null }
       if (!j || !j.add || !j.port) return null
-      const port = String(parseInt(j.port, 10))
-      if (!/^\d+$/.test(port) || !j.id) return null
+      const port = String(j.port)
+      if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535 || !j.id) return null
       tag = String(j.ps || j.remark || '')
       const server = bareHost(String(j.add))
       Object.assign(kv, {
@@ -1169,11 +1198,15 @@ function parseShareLineRaw(line) {
         cipher: yq(j.scy || j.security || 'auto'), udp: 'true'
       })
       // 3x-ui 会写 "tls":"none"，以前只看非空就开了 TLS，节点必然握手失败
-      if (String(j.tls || '').toLowerCase() === 'tls') kv.tls = 'true'
+      if (j.tls === true || String(j.tls || '').toLowerCase() === 'tls') kv.tls = 'true'
       if (j.sni) kv.servername = yq(j.sni)
       if (j.fp) kv['client-fingerprint'] = yq(j.fp)
+      const insecure = j.insecure === undefined ? j.allowInsecure : j.insecure
+      if (insecure === true || insecure === 1 || insecure === '1' || insecure === 'true') kv['skip-cert-verify'] = 'true'
+      if (j.vcn) kv['name-cert-verify'] = yq(j.vcn)
+      if (j.pcs) kv.fingerprint = yq(j.pcs)
       if (j.alpn) { const a = String(j.alpn).split(',').map(s => s.trim()).filter(Boolean); if (a.length) kv.alpn = yqList(a) }
-      shareTransport(kv, { type: j.net, headerType: j.type, path: j.path ? encodeURIComponent(j.path) : '', host: j.host, serviceName: j.path, mode: j.mode })
+      shareTransport(kv, { type: j.net, headerType: j.type, path: j.path, host: j.host, serviceName: j.serviceName || j.path, mode: j.mode })
       return done(server, port)
     }
   }
@@ -1189,6 +1222,8 @@ function parseShareLineRaw(line) {
     const pl = ssPlugin(qi < 0 ? '' : new URLSearchParams(rest.slice(qi + 1)).get('plugin'))
     if (pl === null) return null
     if (pl) { kv.plugin = pl.plugin; if (pl.opts) kv['plugin-opts'] = pl.opts }
+    if (pl && pl.unsupported && pl.unsupported.length) kv._unsupported = pl.unsupported.join(', ')
+    if (pl && pl.extra && Object.keys(pl.extra).length) kv._pluginExtra = pl.extra
     return done(p.server, p.port)
   }
 
@@ -1213,7 +1248,7 @@ function parseShareLineRaw(line) {
 
   let u = null
   try { u = new URL(raw) } catch (e) { return null }
-  const host = bareHost(u.hostname), port = u.port
+  const host = bareHost(u.hostname), port = u.port || (scheme === 'anytls' ? '443' : '')
   if (!host || !port) return null
   const q = {}
   u.searchParams.forEach((v, k) => { q[k] = v })
@@ -1224,6 +1259,7 @@ function parseShareLineRaw(line) {
   if (scheme === 'vless') {
     if (!user) return null
     Object.assign(kv, { type: 'vless', server: yq(host), port, uuid: yq(user), udp: 'true' })
+    if (q.encryption) kv.encryption = yq(q.encryption)
     if (q.flow) kv.flow = yq(q.flow)
     shareTLS(kv, q, 'servername')
     shareTransport(kv, q)
@@ -1241,8 +1277,7 @@ function parseShareLineRaw(line) {
     // `:pass@` 这种只写了 password 的，照旧取 password
     const pwd = whole.startsWith(':') ? whole.slice(1) : whole
     Object.assign(kv, { type: 'hysteria2', server: yq(host), port, password: yq(pwd) })
-    if (q.sni || q.peer) kv.sni = yq(q.sni || q.peer)
-    if (q.insecure === '1' || q.insecure === 'true') kv['skip-cert-verify'] = 'true'
+    shareTLS(kv, { ...q, security: 'tls' }, 'sni')
     // 混淆类型和密码缺一不可：mihomo 见到 obfs 却没有密码会拒绝加载整份配置
     if (q.obfs && q.obfs !== 'none' && q['obfs-password']) { kv.obfs = yq(q.obfs); kv['obfs-password'] = yq(q['obfs-password']) }
     const ports = hyPorts || q.mport || ''
@@ -1257,8 +1292,7 @@ function parseShareLineRaw(line) {
   } else if (scheme === 'anytls') {
     if (!whole) return null
     Object.assign(kv, { type: 'anytls', server: yq(host), port, password: yq(whole), udp: 'true' })
-    if (q.sni) kv.sni = yq(q.sni)
-    if (q.insecure === '1' || q.allowInsecure === '1') kv['skip-cert-verify'] = 'true'
+    shareTLS(kv, { ...q, security: 'tls' }, 'sni')
   } else return null
 
   return done(host, port)
@@ -1637,6 +1671,297 @@ function triesMsg(tries) {
   return parts.join('；')
 }
 
+const OWN_TYPES = ['vless', 'hysteria2', 'ss', 'vmess', 'anytls']
+const OWN_NETS = ['tcp', 'ws', 'httpupgrade', 'grpc', 'h2', 'http', 'xhttp']
+const OWN_SS_METHODS = ['aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm', 'chacha20-ietf-poly1305', 'xchacha20-ietf-poly1305',
+  '2022-blake3-aes-128-gcm', '2022-blake3-aes-256-gcm', '2022-blake3-chacha20-poly1305',
+  'aes-128-ctr', 'aes-192-ctr', 'aes-256-ctr', 'aes-128-cfb', 'aes-192-cfb', 'aes-256-cfb',
+  'aes-128-ccm', 'aes-192-ccm', 'aes-256-ccm', 'aes-128-gcm-siv', 'aes-256-gcm-siv',
+  'chacha20-ietf', 'chacha20', 'xchacha20', 'chacha8-ietf-poly1305', 'xchacha8-ietf-poly1305',
+  'lea-128-gcm', 'lea-192-gcm', 'lea-256-gcm', 'rabbit128-poly1305', 'aegis-128l', 'aegis-256', 'aez-384', 'deoxys-ii-256-128', 'rc4-md5', 'none']
+
+// Missing security is meaningful for pre-extension records; never rewrite those on read.
+function ownSecurity(n) {
+  return n.security === undefined ? (n.type === 'vless' ? (n.net === 'ws' ? 'tls' : 'reality') : n.type === 'vmess' || n.type === 'ss' ? 'none' : 'tls') : n.security
+}
+
+const IMPORT_VMESS_FIELDS = new Set(['v','ps','remark','add','port','id','aid','scy','security','net','type','host','path','tls','sni','fp','alpn','insecure','allowInsecure','vcn','pcs','mode','headers','packetEncoding','serviceName'])
+const IMPORT_QUERY_COMMON = ['sni','peer','fp','alpn','insecure','allowInsecure','allow_insecure','skip-cert-verify','udp','vcn','verifyName','pcs','pinSHA256']
+const IMPORT_QUERY_BYTYPE = { vless:['encryption','flow','security','tls','type','net','path','host','serviceName','servicename','mode','pbk','sid','headerType','packetEncoding'], vmess:['encryption','security','tls','type','net','path','host','serviceName','servicename','mode','headerType','aid','scy','packetEncoding'], hysteria2:['obfs','obfs-password','mport'], ss:['plugin','udp'], anytls:[] }
+const IMPORT_PLUGIN_FIELDS = new Set(['mode','host','path','tls','mux','obfs','obfs-host'])
+const reservedImportQuery = (type,key) => ((type !== 'ss' && IMPORT_QUERY_COMMON.includes(key)) || (IMPORT_QUERY_BYTYPE[type] || []).includes(key)) && !(type === 'hysteria2' && key === 'fp')
+function validateImportExtras(value, type) {
+  let count = 0
+  const visit = (v, depth) => {
+    if (++count > 500 || depth > 8) return false
+    if (v === null || typeof v === 'boolean') return true
+    if (typeof v === 'number') return Number.isFinite(v)
+    if (typeof v === 'string') return v.length <= 32768
+    if (typeof v !== 'object') return false
+    return Object.entries(v).every(([key, child]) => !BAD_KEYS.has(key) && key.length <= 256 && !/[\x00-\x1f\x7f]/.test(key) && visit(child, depth + 1))
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !visit(value, 0)) return false
+  if (JSON.stringify(value).length > 32768 || Object.keys(value).some(k => !['vmess','query','plugin'].includes(k))) return false
+  for (const key of ['vmess','plugin']) if (value[key] !== undefined && (!value[key] || typeof value[key] !== 'object' || Array.isArray(value[key]))) return false
+  if (Object.keys(value.vmess || {}).some(k => IMPORT_VMESS_FIELDS.has(k)) || Object.keys(value.plugin || {}).some(k => IMPORT_PLUGIN_FIELDS.has(k))) return false
+  return value.query === undefined || (Array.isArray(value.query) && value.query.every(pair => Array.isArray(pair) && pair.length === 2 && pair.every(x => typeof x === 'string') && !reservedImportQuery(type,pair[0])))
+}
+
+function normalizeOwnNode(v) {
+  const bad = (err, field) => ({ err, field })
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return bad('节点数据格式错误')
+  if (!OWN_TYPES.includes(v.type)) return bad('不支持的节点协议', 'type')
+  const name = String(v.name || '').trim().slice(0, 32)
+  if (!name) return bad('节点名称不能为空', 'name')
+  if (/[\x00-\x1f\x7f]/.test(name)) return bad('节点名称不能包含控制字符', 'name')
+  const s = bareHost(String(v.s || '').trim()), p = Number(v.p)
+  if (!s || /[\s/?#@\x00-\x1f\x7f]/.test(s)) return bad('服务器地址不能含空白或 URL 路径', 's')
+  if (!/^\d+$/.test(String(v.p)) || !Number.isInteger(p) || p < 1 || p > 65535) return bad('端口必须是 1-65535 的整数', 'p')
+  const n = { name, type: v.type, s, p, u: String(v.u ?? ''), sni: String(v.sni || '').trim() }
+  if (!n.u || n.u.length > 4096) return bad('请填写有效的 UUID / 认证密码', 'u')
+  if (/[\x00-\x1f\x7f]/.test(n.sni)) return bad('SNI 不能含控制字符', 'sni')
+  if (v.importExtras !== undefined) {
+    if (!validateImportExtras(v.importExtras, v.type)) return bad('导入扩展字段必须是安全且不超过 32KB 的 JSON 对象，不能覆盖主配置字段', 'importExtras')
+    n.importExtras = JSON.parse(JSON.stringify(v.importExtras))
+  }
+  if (v.verifyName !== undefined) {
+    n.verifyName = String(v.verifyName).trim()
+    if (n.verifyName.length > 253 || /[\s/\\\x00-\x1f\x7f]/.test(n.verifyName)) return bad('证书校验域名格式不正确', 'verifyName')
+  }
+  if (v.certSha256 !== undefined) {
+    const text = String(v.certSha256).trim(), hex = text.replace(/:/g, '')
+    if (text && !/^[A-Fa-f0-9]{64}$/.test(hex)) return bad('证书 SHA256 指纹应为 64 位十六进制（可含冒号）', 'certSha256')
+    n.certSha256 = hex.toUpperCase()
+  }
+  if (v.security !== undefined) {
+    if (!['none', 'tls', 'reality'].includes(v.security)) return bad('TLS 安全模式不正确', 'security')
+    n.security = v.security
+  }
+  const sec = ownSecurity({ ...n, net: v.net })
+  if (['hysteria2', 'anytls'].includes(n.type) && sec !== 'tls') return bad('该协议必须使用 TLS', 'security')
+  if (sec === 'reality' && n.type !== 'vless') return bad('仅 VLESS 支持这里的 Reality 配置', 'security')
+  for (const key of ['udp', 'insecure', 'uot']) if (v[key] !== undefined) {
+    if (typeof v[key] !== 'boolean') return bad('开关字段必须是布尔值', key)
+    n[key] = v[key]
+  }
+  if (v.fp !== undefined) {
+    n.fp = String(v.fp).trim()
+    if (n.fp && n.fp !== 'none' && !SB_UTLS.has(n.fp)) return bad('不支持的客户端指纹', 'fp')
+    if (n.type === 'hysteria2' && n.fp && n.fp !== 'none') return bad('HY2 使用 QUIC，不支持 TCP uTLS 客户端指纹', 'fp')
+  }
+  if (v.alpn !== undefined) {
+    if (!Array.isArray(v.alpn) || v.alpn.length > 16 || v.alpn.some(x => typeof x !== 'string' || !x || x.length > 128 || /[\s,\x00-\x1f\x7f]/.test(x))) return bad('ALPN 必须是协议名称列表', 'alpn')
+    n.alpn = [...new Set(v.alpn)]
+  }
+  if (['vless', 'vmess'].includes(n.type)) {
+    n.u = n.u.trim()
+    n.net = v.net || 'tcp'
+    if (!OWN_NETS.includes(n.net)) return bad('不支持的传输方式', 'net')
+    for (const key of ['path', 'host', 'serviceName', 'mode', 'earlyDataHeader']) if (v[key] !== undefined) {
+      n[key] = String(v[key])
+      if (key === 'path' && n.net === 'ws') n[key] = normalizeWsPath(n[key])
+      if (n[key].length > 4096 || /[\x00-\x1f\x7f]/.test(n[key])) return bad('传输参数含非法字符或过长', key)
+    }
+    if (['ws', 'httpupgrade', 'h2', 'http', 'xhttp'].includes(n.net) && n.path && !n.path.startsWith('/')) return bad('传输路径必须以 / 开头', 'path')
+    if (n.net === 'xhttp' && n.mode && !['auto', 'packet-up', 'stream-up', 'stream-one'].includes(n.mode)) return bad('XHTTP 模式不正确', 'mode')
+    if (v.headers !== undefined) {
+      if (!v.headers || typeof v.headers !== 'object' || Array.isArray(v.headers) || Object.keys(v.headers).length > 30) return bad('请求头必须是名称与字符串值组成的对象', 'headers')
+      n.headers = {}
+      for (const [key, val] of Object.entries(v.headers)) {
+        if (BAD_KEYS.has(key) || !/^[!#$%&'*+.^_`|~\w-]+$/.test(key) || typeof val !== 'string' || /[\r\n\x00]/.test(val) || val.length > 4096) return bad('请求头名称或值不合法', 'headers')
+        n.headers[key] = val
+      }
+    }
+    if (v.packetEncoding !== undefined) {
+      if (!['', 'xudp', 'packetaddr'].includes(v.packetEncoding)) return bad('UDP 包编码不正确', 'packetEncoding')
+      n.packetEncoding = v.packetEncoding
+    }
+  }
+  if (n.type === 'vless') {
+    n.flow = v.flow === undefined ? (v.security === undefined && n.net === 'tcp' ? 'xtls-rprx-vision' : '') : String(v.flow)
+    if (!['', 'xtls-rprx-vision', 'xtls-rprx-vision-udp443'].includes(n.flow)) return bad('不支持的 VLESS Flow', 'flow')
+    if (v.encryption !== undefined) {
+      n.encryption = String(v.encryption).trim()
+      if (!n.encryption || n.encryption.length > 8192 || /[\s\x00-\x1f\x7f]/.test(n.encryption)) return bad('VLESS encryption 必须是完整的单行配置，禁用时填 none', 'encryption')
+      if (n.encryption !== 'none' && !/^mlkem768x25519plus\.(native|xorpub|random)\.(0rtt|1rtt)\./.test(n.encryption)) return bad('请粘贴官方工具生成的 VLESS Encryption 配置，或填 none', 'encryption')
+    }
+    if (n.flow && sec === 'none' && (!n.encryption || n.encryption === 'none')) return bad('未启用 TLS / Reality 或 VLESS Encryption 时不能启用 Vision', 'flow')
+    if (n.flow && n.net !== 'tcp' && (!n.encryption || n.encryption === 'none')) return bad('Vision Flow 只适用于 TCP，或已启用 VLESS Encryption 的节点', 'flow')
+    if (sec === 'reality') {
+      n.pk = String(v.pk || '').trim(); n.sid = String(v.sid || '').trim()
+      if (!/^[A-Za-z0-9_-]{43}$/.test(n.pk)) return bad('Reality 公钥应是 43 位 base64url', 'pk')
+      if (!/^([0-9a-fA-F]{2}){0,8}$/.test(n.sid)) return bad('Reality ShortId 应为偶数位十六进制，最多 16 位', 'sid')
+      if (n.fp === 'none') return bad('Reality 需要客户端指纹，不能选择 none', 'fp')
+    }
+  }
+  if (n.type === 'ss' || n.type === 'vmess') {
+    n.cipher = String(v.cipher || (n.type === 'ss' ? 'aes-128-gcm' : 'auto'))
+    if (!(n.type === 'ss' ? OWN_SS_METHODS.includes(n.cipher) : SB_VMESS.has(n.cipher))) return bad('不支持的加密方式', 'cipher')
+    if (n.type === 'ss' && n.cipher.startsWith('2022-')) {
+      const size = n.cipher === '2022-blake3-aes-128-gcm' ? 16 : 32
+      try {
+        for (const key of n.u.split(':')) if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(key) || b64uDecode(key).length !== size) return bad('SS2022 的每段密钥必须是 ' + size + ' 字节的 Base64', 'u')
+      } catch (e) { return bad('SS2022 密钥的 Base64 格式不正确', 'u') }
+    }
+    if (n.type === 'vmess') {
+      if (v.alterId !== undefined && typeof v.alterId !== 'number') return bad('AlterID 必须是 JSON 数字', 'alterId')
+      n.alterId = v.alterId === undefined ? 0 : Number(v.alterId)
+      if (!Number.isInteger(n.alterId) || n.alterId < 0 || n.alterId > 65535) return bad('AlterID 必须是 0-65535 的整数，推荐 0', 'alterId')
+    } else {
+      if (v.uotVersion !== undefined) {
+        if (![1, 2].includes(v.uotVersion)) return bad('UDP-over-TCP 版本只能是 1 或 2', 'uotVersion')
+        n.uotVersion = v.uotVersion
+      }
+      n.plugin = String(v.plugin || '')
+      if (!['', 'obfs', 'v2ray-plugin'].includes(n.plugin)) return bad('插件仅支持 obfs 和 v2ray-plugin', 'plugin')
+      if (v.pluginOpts !== undefined && (!v.pluginOpts || typeof v.pluginOpts !== 'object' || Array.isArray(v.pluginOpts))) return bad('插件参数格式错误', 'pluginOpts')
+      n.pluginOpts = {}
+      const po = v.pluginOpts || {}
+      if (Object.keys(po).some(k => !['mode', 'host', 'path', 'tls', 'mux'].includes(k))) return bad('插件参数中有尚未支持的字段，不能静默删除', 'pluginOpts')
+      for (const key of ['mode', 'host', 'path']) if (po[key] !== undefined) {
+        n.pluginOpts[key] = String(po[key])
+        if (/[\r\n\x00]/.test(n.pluginOpts[key]) || n.pluginOpts[key].length > 4096) return bad('插件参数包含非法字符', 'pluginOpts')
+      }
+      for (const key of ['tls', 'mux']) if (po[key] !== undefined) {
+        if (![true, false, 'true', 'false'].includes(po[key])) return bad('插件开关必须是布尔值', 'pluginOpts')
+        n.pluginOpts[key] = String(po[key]) === 'true'
+      }
+      if (n.plugin && !sbPlugin(n.plugin, n.pluginOpts)) return bad('该插件模式无法正确导出，请使用 obfs http/tls 或 v2ray-plugin websocket', 'pluginOpts')
+    }
+  }
+  if (n.type === 'hysteria2') {
+    n.obfs = String(v.obfs || ''); n.opwd = String(v.opwd || '')
+    if (!['', 'salamander'].includes(n.obfs)) return bad('当前客户端兼容模式仅支持 Salamander 混淆', 'obfs')
+    if (n.obfs && !n.opwd) return bad('启用混淆后必须填写混淆密码', 'opwd')
+    if (v.ports !== undefined) {
+      n.ports = String(v.ports).trim()
+      if (n.ports && (!/^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(n.ports) || sbPorts(n.ports).length !== n.ports.split(',').length)) return bad('端口跳跃范围必须在 1-65535 内，且起点不大于终点', 'ports')
+    }
+  }
+  const numeric = n.type === 'hysteria2' ? ['hopInterval', 'upMbps', 'downMbps'] : n.type === 'anytls' ? ['idleCheck', 'idleTimeout', 'minIdle'] : ['earlyData']
+  for (const key of numeric) if (v[key] !== undefined && v[key] !== '') {
+    if (typeof v[key] !== 'number') return bad('数值字段必须是 JSON 数字', key)
+    const x = Number(v[key]), min = ['minIdle', 'earlyData'].includes(key) ? 0 : 0.001
+    if (!Number.isFinite(x) || x < min || x > (key.endsWith('Mbps') ? 1000000 : 86400) || (!key.endsWith('Mbps') && !Number.isInteger(x))) return bad('数值必须在有效范围内', key)
+    n[key] = x
+  }
+  return { node: n }
+}
+
+// Own nodes use the same normalized key representation as imported nodes.
+function ownToKv(n) {
+  const sec = ownSecurity(n), legacy = n.security === undefined
+  const kv = { type: n.type, server: yq(n.s), port: String(n.p), udp: String(n.udp !== false) }
+  if (n.type === 'vless' || n.type === 'vmess') {
+    kv.uuid = yq(n.u)
+    kv.tls = String(sec !== 'none')
+    kv.servername = yq(n.sni || (n.net === 'ws' ? n.s : ''))
+    shareTransport(kv, { type: n.net === 'http' ? 'tcp' : n.net || 'tcp', headerType: n.net === 'http' ? 'http' : '', path: n.path, host: n.host || (n.headers && n.headers.Host) || (n.net === 'ws' ? n.sni || n.s : ''), serviceName: n.serviceName, mode: n.mode || 'auto' })
+    if (n.net === 'ws' || n.net === 'httpupgrade') {
+      const w = parseFlow(kv['ws-opts'])
+      if (w['v2ray-http-upgrade'] !== undefined) w['v2ray-http-upgrade'] = String(w['v2ray-http-upgrade']) === 'true'
+      w.headers = { ...(n.headers || {}), ...(w.headers || {}) }
+      const early = n.earlyData === undefined ? (legacy && n.type === 'vless' && n.net === 'ws' ? 2048 : 0) : n.earlyData
+      if (early) { w['max-early-data'] = early; w['early-data-header-name'] = n.earlyDataHeader || 'Sec-WebSocket-Protocol' }
+      kv['ws-opts'] = JSON.stringify(w)
+    }
+    if (n.type === 'vless') {
+      kv.encryption = yq(n.encryption || 'none')
+      if (n.flow) kv.flow = yq(n.flow)
+      kv['packet-encoding'] = yq(n.packetEncoding === undefined ? 'xudp' : n.packetEncoding)
+    } else {
+      kv.cipher = yq(n.cipher || 'auto'); kv.alterId = String(n.alterId || 0)
+      if (n.packetEncoding) kv['packet-encoding'] = n.packetEncoding
+    }
+  } else {
+    kv.password = yq(n.u)
+    if (n.type === 'ss') {
+      kv.cipher = yq(n.cipher || 'aes-128-gcm')
+      if (n.uot) { kv['udp-over-tcp'] = 'true'; kv['udp-over-tcp-version'] = String(n.uotVersion || 2) }
+      if (n.plugin) { kv.plugin = n.plugin; kv['plugin-opts'] = JSON.stringify(n.pluginOpts || {}) }
+    } else {
+      kv.sni = yq(n.sni || '')
+      kv.tls = 'true'
+      if (n.type === 'hysteria2') {
+        if (n.ports) kv.ports = yq(n.ports)
+        if (n.obfs && n.opwd) { kv.obfs = yq(n.obfs); kv['obfs-password'] = yq(n.opwd) }
+        if (n.hopInterval) kv['hop-interval'] = String(n.hopInterval)
+        if (n.upMbps) kv.up = String(n.upMbps)
+        if (n.downMbps) kv.down = String(n.downMbps)
+      } else if (n.type === 'anytls') {
+        for (const [a, b] of [['idleCheck', 'idle-session-check-interval'], ['idleTimeout', 'idle-session-timeout'], ['minIdle', 'min-idle-session']]) if (n[a] !== undefined) kv[b] = String(n[a])
+      }
+    }
+  }
+  if (sec !== 'none' && n.type !== 'ss') {
+    const fp = n.fp === undefined ? (n.type === 'vless' ? 'chrome' : '') : n.fp
+    if (fp && n.type !== 'hysteria2') kv['client-fingerprint'] = yq(fp)
+    if (n.verifyName) kv['name-cert-verify'] = yq(n.verifyName)
+    if (n.certSha256) kv.fingerprint = yq(n.certSha256)
+    if (n.alpn && n.alpn.length) kv.alpn = yqList(n.alpn)
+    kv['skip-cert-verify'] = String(n.insecure === undefined ? legacy && n.type === 'hysteria2' : n.insecure)
+    if (sec === 'reality') kv['reality-opts'] = JSON.stringify({ 'public-key': n.pk || '', 'short-id': n.sid || '' })
+  }
+  return kv
+}
+
+function ownSRUnsafeField(n) {
+  return ['name', 's', 'u', 'sni', 'path', 'host', 'pk', 'sid', 'opwd'].find(k => /["\\\r\n\x00]/.test(String(n[k] || '')))
+}
+
+function ownCompatibility(n) {
+  const out = [], add = (format, field, reason) => out.push({ format, field, reason })
+  const net = n.net || 'tcp'
+  if (n.importExtras) {
+    const keys = [...Object.keys(n.importExtras.vmess || {}), ...(n.importExtras.query || []).map(([key]) => key), ...Object.keys(n.importExtras.plugin || {})]
+    if (keys.length) for (const format of ['clash','singbox','shadowrocket']) add(format, 'importExtras', '导入扩展字段已保留，但当前完整配置尚未应用：' + [...new Set(keys)].join(', '))
+  }
+  if (n.certSha256 || n.verifyName) for (const field of ['certSha256','verifyName']) if (n[field]) {
+    add('singbox', field, '当前兼容的 sing-box 1.12–1.14 无法忠实表达该证书校验设置，该节点不下发')
+    add('shadowrocket', field, '当前原生 conf 转换不支持该证书校验设置，该节点不下发')
+  }
+  const unsafe = ownSRUnsafeField(n)
+  if (unsafe) add('shadowrocket', unsafe, '原生 conf 无法无损表示该字段的特殊字符，该节点不下发')
+  if (n.udp === false) add('share', 'udp', '通用分享 URI 不携带 UDP 开关，请使用完整配置订阅')
+  if (n.type === 'vless' && n.encryption && n.encryption !== 'none') {
+    add('singbox', 'encryption', 'sing-box 不支持 VLESS Encryption，该节点不下发')
+    add('shadowrocket', 'encryption', 'Shadowrocket 原生 conf 无此字段，该节点不下发')
+  }
+  if (['vless', 'vmess'].includes(n.type)) {
+    if (['xhttp', 'http'].includes(net)) add('singbox', 'net', 'sing-box 不支持该传输，该节点不下发')
+    if (!srNetOk(net)) add('shadowrocket', 'net', 'Shadowrocket conf 不支持该传输，该节点不下发')
+    if (n.earlyData) {
+      add('share', 'earlyData', '分享 URI 没有通用的 WS early-data 表达；请使用完整配置订阅')
+      add('shadowrocket', 'earlyData', '原生 conf 不下发 WebSocket early-data 参数')
+      if (net === 'httpupgrade') add('singbox', 'earlyData', 'HTTPUpgrade transport 不支持 WS early-data 参数')
+    }
+    if (n.headers && Object.keys(n.headers).some(k => k.toLowerCase() !== 'host')) {
+      add('share', 'headers', '分享 URI 不能完整携带自定义请求头')
+      add('shadowrocket', 'headers', '原生 conf 仅携带 WS Host，不携带其他请求头')
+    }
+  }
+  if (n.fp && n.fp !== 'none') add('shadowrocket', 'fp', '原生 conf 不下发客户端指纹，请在客户端设置')
+  if (n.alpn && n.alpn.length) add('shadowrocket', 'alpn', '原生 conf 不下发 ALPN，请在客户端设置')
+  if (n.packetEncoding) {
+    add('share', 'packetEncoding', 'UDP 包编码不属于通用分享 URI 字段')
+    add('shadowrocket', 'packetEncoding', '原生 conf 不下发 UDP 包编码')
+  }
+  if (n.type === 'anytls') for (const field of ['idleCheck', 'idleTimeout', 'minIdle']) if (n[field] !== undefined) {
+    add('share', field, 'AnyTLS 会话参数请使用 Clash 或 sing-box 完整配置')
+    add('shadowrocket', field, '原生 conf 不下发 AnyTLS 会话池参数')
+  }
+  if (n.type === 'hysteria2') for (const field of ['hopInterval', 'upMbps', 'downMbps']) if (n[field] !== undefined) {
+    add('share', field, '该 HY2 调优参数没有通用分享 URI 表达')
+    add('shadowrocket', field, '原生 conf 不下发该 HY2 调优参数')
+  }
+  if (n.type === 'ss') {
+    if (n.plugin) add('shadowrocket', 'plugin', '原生 conf 无法忠实表示 SS 插件，该节点不下发')
+    if (!SB_SS.has(n.cipher) && !SB_SS_ALIAS[n.cipher]) add('singbox', 'cipher', 'sing-box 不支持该加密方式，该节点不下发')
+    if (n.uot) { add('share', 'uot', 'SIP002 没有通用 UDP-over-TCP 参数'); add('shadowrocket', 'uot', '原生 conf 不下发 UDP-over-TCP 参数') }
+  }
+  return out
+}
+
 // 分享链接 → 自有节点的表单字段。复用 parseShareLine，避免前后端各写一套解析：
 // 那样迟早出现「订阅里能认、手动添加却认不出」这种自相矛盾。
 function shareToOwn(link) {
@@ -1644,31 +1969,97 @@ function shareToOwn(link) {
   if (!kv) return null
   const v = k => kv[k] === undefined ? '' : unquote(kv[k])
   const t = v('type')
-  if (t !== 'vless' && t !== 'hysteria2')
-    return { err: `这条链接是 ${t} 协议，自有节点目前只支持 VLESS Reality 与 Hysteria2` }
-  const o = { name: kv._name || '', type: t, s: v('server'), p: v('port') }
-  if (t === 'vless') {
+  if (!OWN_TYPES.includes(t)) return { err: `自有节点不支持 ${t}，请选择 VLESS / HY2 / SS / VMess / AnyTLS` }
+  const beforeFragment = String(link).split('#')[0], queryAt = beforeFragment.indexOf('?')
+  const params = new URLSearchParams(queryAt < 0 ? '' : beforeFragment.slice(queryAt + 1))
+  const supported = new Set([...(t === 'ss' ? [] : IMPORT_QUERY_COMMON), ...IMPORT_QUERY_BYTYPE[t]])
+  if ([...supported].some(key => new Set(params.getAll(key)).size > 1)) return { err: '同一连接参数出现不同的重复值，请确认原链接后重试' }
+  const unknown = [...params.keys()].filter(k => !supported.has(k))
+  const extras = {}
+  if (unknown.length) extras.query = [...params.entries()].filter(([key]) => !supported.has(key))
+  if (kv._pluginExtra) extras.plugin = kv._pluginExtra
+  const enums = { security:['none','tls','reality'], tls:['none','tls','reality'], flow:['','xtls-rprx-vision','xtls-rprx-vision-udp443'], mode:['auto','packet-up','stream-up','stream-one'], packetEncoding:['','xudp','packetaddr'], headerType:['none','http'] }
+  for (const [field, allowed] of Object.entries(enums)) if (supported.has(field) && params.has(field) && !allowed.includes(params.get(field))) return { err: '分享链接参数 ' + field + ' 的值不受支持，未导入' }
+  let vmessJson = null
+  if (t === 'vmess') {
+    const body = String(link).trim().slice(String(link).trim().indexOf('://') + 3).split('#')[0]
+    if (!body.includes('@')) {
+      vmessJson = JSON.parse(b64decode(safeDecode(body)))
+      const additional = Object.fromEntries(Object.entries(vmessJson).filter(([key]) => !IMPORT_VMESS_FIELDS.has(key)))
+      if (Object.keys(additional).length) extras.vmess = additional
+      if (vmessJson.tls && vmessJson.tls !== true && !['none','tls'].includes(vmessJson.tls)) return { err: 'VMess JSON 的 TLS 模式不受支持' }
+      if (vmessJson.mode && !enums.mode.includes(vmessJson.mode)) return { err: 'VMess XHTTP 模式不受支持' }
+      if (vmessJson.type && !enums.headerType.includes(vmessJson.type)) return { err: 'VMess 伪装类型不受支持' }
+    }
+  }
+  if (t === 'hysteria2' && params.get('obfs') && params.get('obfs') !== 'none' && !params.get('obfs-password')) return { err: 'HY2 混淆缺少密码，未导入' }
+  const o = { name: kv._name || '', type: t, s: v('server'), p: v('port'), udp: v('udp') !== 'false' }
+  const ro = parseFlow(v('reality-opts'))
+  if (t === 'vless' || t === 'vmess') {
     o.u = v('uuid')
     o.sni = v('servername') || v('sni')
-    const ro = parseFlow(v('reality-opts'))
     o.pk = ro['public-key'] || ''
     o.sid = ro['short-id'] || ''
     const net = v('network')
     // WebSocket + TLS（常见的套 CDN 方案）也是自有节点支持的形态；以前一律当成 tcp，
     // 导进来就变成一个要 Reality 公钥、根本连不上的节点
-    o.net = net === 'xhttp' ? 'xhttp' : net === 'ws' && !o.pk ? 'ws' : 'tcp'
-    o.flow = o.net === 'tcp' ? (v('flow') || 'xtls-rprx-vision') : ''
+    o.net = net || 'tcp'
+    o.flow = v('flow') || ''
+    o.security = o.pk ? 'reality' : v('tls') === 'true' ? 'tls' : 'none'
+    if (t === 'vless') {
+      if (new URL(String(link).trim()).searchParams.get('security') === 'reality') o.security = 'reality'
+      if (o.security === 'reality' && !o.pk) o.warn = '这条链接里没有 Reality 公钥（pbk），保存前要手动补上'
+    }
     if (o.net === 'ws') {
       const w = parseFlow(v('ws-opts'))
       o.path = w.path || '/'
       o.host = (w.headers && (w.headers.Host || w.headers.host)) || ''
-    } else if (!o.pk) o.warn = '这条链接里没有 Reality 公钥（pbk），保存前要手动补上'
+      if (w.headers) o.headers = w.headers
+      if (String(w['v2ray-http-upgrade']) === 'true') o.net = 'httpupgrade'
+      if (w['max-early-data']) o.earlyData = Number(w['max-early-data'])
+      if (w['early-data-header-name']) o.earlyDataHeader = w['early-data-header-name']
+    } else if (o.net === 'grpc') o.serviceName = parseFlow(v('grpc-opts'))['grpc-service-name'] || ''
+    else if (o.net === 'h2' || o.net === 'http' || o.net === 'xhttp') {
+      const opts = parseFlow(v(o.net + '-opts'))
+      o.path = [].concat(opts.path || '/')[0]
+      o.host = [].concat(opts.host || (opts.headers && opts.headers.Host) || []).join(',')
+      if (o.net === 'xhttp') o.mode = opts.mode || 'auto'
+    }
+    if (t === 'vless') { o.encryption = v('encryption') || 'none'; if (v('packet-encoding')) o.packetEncoding = v('packet-encoding') }
+    else { o.cipher = v('cipher') || 'auto'; o.alterId = Number(v('alterId') || 0) }
   } else {
     o.u = v('password')
     o.sni = v('sni') || v('servername')
-    o.obfs = v('obfs') || ''
-    o.opwd = v('obfs-password') || ''
-    o.ports = v('ports') || ''
+    o.security = t === 'ss' ? 'none' : 'tls'
+    if (t === 'ss') { o.cipher = v('cipher'); o.plugin = v('plugin'); o.pluginOpts = parseFlow(v('plugin-opts')) }
+    if (t === 'hysteria2') { o.obfs = v('obfs'); o.opwd = v('obfs-password'); o.ports = v('ports') }
+  }
+  o.fp = v('client-fingerprint') || (o.security === 'reality' ? 'chrome' : 'none')
+  if (t === 'hysteria2' && o.fp !== 'none') {
+    extras.query = [...(extras.query || []), ['fp', o.fp]]
+    o.fp = 'none'
+  }
+  o.insecure = v('skip-cert-verify') === 'true'
+  if (v('name-cert-verify')) o.verifyName = v('name-cert-verify')
+  if (v('fingerprint')) o.certSha256 = v('fingerprint')
+  if (params.has('udp')) o.udp = !['false', '0'].includes(params.get('udp'))
+  if (params.has('packetEncoding')) o.packetEncoding = params.get('packetEncoding')
+  if (vmessJson && vmessJson.headers !== undefined) o.headers = vmessJson.headers
+  if (vmessJson && vmessJson.packetEncoding !== undefined) o.packetEncoding = vmessJson.packetEncoding
+  if (v('alpn')) o.alpn = splitTop(v('alpn').replace(/^\[|\]$/g, '')).map(x => unquote(x.trim())).filter(Boolean)
+  if (o.net && !OWN_NETS.includes(o.net)) return { err: '该传输方式尚不能在自有节点编辑器中无损编辑，未导入' }
+  if (o.cipher && !(t === 'ss' ? OWN_SS_METHODS.includes(o.cipher) : SB_VMESS.has(o.cipher))) return { err: '该加密方式尚不受支持，未导入' }
+  if (o.fp && o.fp !== 'none' && !SB_UTLS.has(o.fp)) return { err: '该客户端指纹尚不受支持，未导入' }
+  if (Object.keys(extras).length) {
+    if (!validateImportExtras(extras, t)) return { err: '链接扩展字段包含不安全或冲突的键名、过深结构，或超过 32KB，未导入' }
+    o.importExtras = extras
+    const names = [...Object.keys(extras.vmess || {}), ...(extras.query || []).map(([key]) => key), ...Object.keys(extras.plugin || {})]
+    o.warn = [o.warn, '已导入；扩展字段已保留：' + [...new Set(names)].join(', ') + '。完整配置尚未应用这些字段，请在高级配置中核对。'].filter(Boolean).join('；')
+  }
+  const validated = normalizeOwnNode(o)
+  if (validated.err) {
+    if (validated.field === 'pk' || validated.field === 'sid') o.warn = o.warn || validated.err
+    else return { err: validated.err + '，未导入' }
   }
   return { node: o }
 }
@@ -1914,7 +2305,8 @@ async function renderSub(prof, fmt, opts, event) {
   const f = applyProfile(prof, rawOwn, up, rawPol.filter(p => p.enabled !== false))
   // URL 上的 mode 优先，其次用档案自己的设定
   const black = (opts.mode || prof.mode || 'whitelist') === 'blacklist'
-  const out = { fmt, usage: usageOf(prof, ups, d.meta), ext: '', nodes: Object.keys(f.own).length + f.up.length, policies: f.policies.length }
+  const warnings = Object.values(f.own).flatMap(n => ownCompatibility(n).filter(w => w.format === fmt).map(w => ({ name: n.name, ...w })))
+  const out = { fmt, usage: usageOf(prof, ups, d.meta), ext: '', nodes: Object.keys(f.own).length + f.up.length, policies: f.policies.length, warnings }
   // 链式节点是 Clash / sing-box 专有能力，分享链接格式里没有对应表达，
   // 只能整条略过 —— 硬塞一个落地节点进去会变成不带中转的直连，出口 IP 全变。
   if (fmt === 'share') return { ...out, body: genShare(f.up, f.own, set), type: 'text/plain; charset=utf-8' }
@@ -1960,8 +2352,30 @@ async function recordHitNow(prof, req, fmt) {
 
 async function handle(req, event) {
   const url = new URL(req.url)
+  const local = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(url.hostname)
+  if (url.protocol === 'http:' && !local) {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return json({ ok: false, msg: '请使用 HTTPS 重新发起请求' }, 400)
+    url.protocol = 'https:'
+    return new Response(null, { status: 308, headers: { Location: url.href, 'Cache-Control': 'no-store' } })
+  }
+  let response
+  try { response = await handleRequest(req, event) }
+  catch (e) {
+    if (!(e instanceof SecurityStateError)) throw e
+    response = json({ ok: false, msg: e.message }, 503, { 'Retry-After': '30' })
+  }
+  if (url.protocol !== 'https:') return response
+  const headers = new Headers(response.headers)
+  headers.set('Strict-Transport-Security', 'max-age=31536000')
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+}
+
+async function handleRequest(req, event) {
+  const url = new URL(req.url)
   const path = url.pathname
 
+  if (path === '/' && !url.searchParams.has('token') && (req.method === 'GET' || req.method === 'HEAD'))
+    return new Response(null, { status: 302, headers: { Location: '/admin', 'Cache-Control': 'no-store' } })
   if (path === '/admin' || path.startsWith('/admin/')) return adminRoute(req, url)
   if (path.startsWith('/api/')) return apiRoute(req, url, event)
   // 浏览器打开管理端时会顺手要图标，爬虫会要 robots —— 以前它们都掉进订阅逻辑，
@@ -2002,6 +2416,7 @@ async function handle(req, event) {
     'Content-Disposition': contentDisposition(prof.name, r.fmt === 'shadowrocket' ? 'conf' : '')
   }
   if (r.usage) h['Subscription-Userinfo'] = r.usage
+  if (r.warnings && r.warnings.length) h['X-Subscription-Warnings'] = String(r.warnings.length) + '; see admin preview for compatibility details'
   return new Response(r.body, { headers: h })
 }
 
@@ -2019,7 +2434,7 @@ function json(o, s = 200, extra) {
 
 // 管理端页面的安全头。
 // CSP 里只能留 'unsafe-inline'（页面是单文件内联脚本加内联事件），但 connect-src 'self'
-// 仍然有用：就算哪天漏了转义让脚本注进来，它也没法把配置 fetch 到外面去。
+// 仍能限制外部连接，但不能替代不可信内容的转义或保证 XSS 时不会泄露。
 // frame-ancestors 防点击劫持；no-referrer 防订阅地址里的 token 经 Referer 漏给外站。
 const ADMIN_HEADERS = {
   'Content-Type': 'text/html; charset=utf-8',
@@ -2048,27 +2463,29 @@ async function adminRoute(req, url) {
     if (crossSite(req, url)) return json({ ok: false, msg: '拒绝跨站请求' }, 403)
     const gate = await loginGate(req)
     if (gate.wait) return json({ ok: false, msg: `尝试次数过多，请 ${Math.ceil(gate.wait / 60)} 分钟后再试` }, 429)
-    const { password, initToken } = await req.json().catch(() => ({}))
-    const stored = await kvGet('auth:password', null)
+    try {
+      const { password, initToken } = await req.json().catch(() => ({}))
+      const stored = await kvGet('auth:password', null)
 
-    // 首次初始化：必须出示初始化令牌，避免管理端在设密码前裸奔
-    if (!stored) {
-      // 未注入 SETUP_TOKEN 时（例如手动部署）允许直接设密码，否则必须出示它
-      if (INIT_TOKEN && !safeEq(String(initToken || ''), INIT_TOKEN)) {
-        await gate.done(false)
-        return json({ ok: false, msg: '初始化令牌不正确' }, 403)
+      // 首次初始化：必须出示初始化令牌，避免管理端在设密码前裸奔
+      if (!stored) {
+        // 未注入 SETUP_TOKEN 时（例如手动部署）允许直接设密码，否则必须出示它
+        if (INIT_TOKEN && !safeEq(String(initToken || ''), INIT_TOKEN)) {
+          await gate.done(false)
+          return json({ ok: false, msg: '初始化令牌不正确' }, 403)
+        }
+        await gate.done(true)
+        if (!password || String(password).length < 8) return json({ ok: false, msg: '密码至少 8 位' }, 400)
+        await kvPut('auth:password', await hashPassword(password))
+      } else {
+        const v = await verifyPassword(password || '', stored)
+        const left = await gate.done(v.ok)
+        if (!v.ok) return json({ ok: false, msg: left > 0 ? `密码错误，还可再试 ${left} 次` : '密码错误次数过多，已锁定 15 分钟' }, 401)
+        // 老的无盐哈希趁这次登录换掉，用户无感
+        if (v.legacy) await kvPut('auth:password', await hashPassword(password))
       }
-      await gate.done(true)
-      if (!password || String(password).length < 8) return json({ ok: false, msg: '密码至少 8 位' }, 400)
-      await kvPut('auth:password', await hashPassword(password))
-    } else {
-      const v = await verifyPassword(password || '', stored)
-      const left = await gate.done(v.ok)
-      if (!v.ok) return json({ ok: false, msg: left > 0 ? `密码错误，还可再试 ${left} 次` : '密码错误次数过多，已锁定 15 分钟' }, 401)
-      // 老的无盐哈希趁这次登录换掉，用户无感
-      if (v.legacy) await kvPut('auth:password', await hashPassword(password))
-    }
-    return json({ ok: true }, 200, { 'Set-Cookie': sessCookie(await makeCookie(), req) })
+      return json({ ok: true }, 200, { 'Set-Cookie': sessCookie(await makeCookie(), req) })
+    } finally { await gate.done() }
   }
 
   // 登出只收本站页面发来的 POST：GET 登出、跨站表单都能被别的网站用来把管理员踢下线
@@ -2266,8 +2683,8 @@ async function apiRoute(req, url, event) {
     for (const ua of UPSTREAM_UAS) {
       let r = null
       try { r = await fetchRaw(u.url, ua) }
-      catch (e) { tries.push({ ua, err: String(e && e.message || e) }); continue }
-      if (!r.ok) { tries.push({ ua, status: r.status, body: await errBody(r) }); continue }
+      catch (e) { tries.push({ ua, err: '网络请求失败' }); continue }
+      if (!r.ok) { tries.push({ ua, status: r.status }); continue }
       const raw = await r.text()
       const decoded = looksBase64(raw) ? b64decode(raw) : raw
       const { nodes, notes } = splitFeed(decoded)
@@ -2277,17 +2694,14 @@ async function apiRoute(req, url, event) {
     if (!win) return json({ ok: true, name: u.name, http: 0, tries, snap: snapInfo, err: triesMsg(tries) })
 
     const hdrs = {}
-    for (const k of ['subscription-userinfo', 'content-type', 'content-disposition', 'profile-update-interval', 'profile-web-page-url'])
-      if (win.r.headers.get(k)) hdrs[k] = win.r.headers.get(k)
     const head = parseUserinfo(win.r.headers.get('subscription-userinfo'))
+    if (head) hdrs['subscription-userinfo'] = `upload=${head.up}; download=${head.down}; total=${head.total}; expire=${head.expire}`
     const note = parseNotes(win.notes)
     return json({
       ok: true, name: u.name, http: win.r.status, bytes: win.raw.length,
       fmt: feedFormat(win.raw, win.decoded), ua: win.ua, tries, snap: snapInfo,
       headers: hdrs, hasUserinfo: !!win.r.headers.get('subscription-userinfo'),
-      nodes: win.nodes.length, notes: win.notes, head, note, meta: mergeMeta(head, note),
-      // 前若干行原文，用于识别没见过的格式；顺带抹掉密钥字段
-      sample: win.decoded.split('\n').filter(l => l.trim()).slice(0, 14).map(scrub)
+      nodes: win.nodes.length, noteCount: win.notes.length, head, note, meta: mergeMeta(head, note)
     })
   }
 
@@ -2621,38 +3035,14 @@ async function apiRoute(req, url, event) {
       if (!b.own || typeof b.own !== 'object' || Array.isArray(b.own)) return json({ ok: false, msg: '数据格式错误' }, 400)
 
       const clean = {}
+      const previous = await loadOwn()
       for (const [k, v] of Object.entries(b.own)) {
-        if (!v || typeof v !== 'object') return json({ ok: false, msg: '数据格式错误' }, 400)
-        const key = String(k).replace(/[^\w-]/g, '').slice(0, 24)
-        if (!key) return json({ ok: false, msg: '节点标识只能是字母数字和连字符' }, 400)
-        const name = String(v.name || '').trim().slice(0, 32)
-        const type = v.type === 'hysteria2' ? 'hysteria2' : 'vless'
-        if (!name) return json({ ok: false, msg: '节点名称不能为空' }, 400)
-        if (!v.s || !v.p || !v.u) return json({ ok: false, msg: `「${name}」缺少服务器/端口/密钥` }, 400)
-        const n = { name, type, s: String(v.s).trim(), p: parseInt(v.p, 10) || 443, u: String(v.u).trim(), sni: String(v.sni || '').trim() }
-        if (type === 'vless') {
-          const net = (v.net === 'xhttp' || v.net === 'ws') ? v.net : 'tcp'
-          n.net = net
-          if (net === 'ws') {
-            n.path = String(v.path || '/').trim() || '/'
-            if (v.host) n.host = String(v.host).trim()
-            n.flow = ''
-          } else {
-            // Reality 缺公钥会让客户端握手失败，报错信息又极难定位，提前挡住
-            if (!v.pk || !v.sid) return json({ ok: false, msg: `「${name}」是 VLESS Reality，必须填公钥与 ShortId` }, 400)
-            n.pk = String(v.pk).trim(); n.sid = String(v.sid).trim()
-            // 手输的公钥错一个字符，客户端就拒绝加载整份订阅，所以这里就挡住
-            if (!/^[A-Za-z0-9_-]{43}$/.test(n.pk)) return json({ ok: false, msg: `「${name}」的 Reality 公钥格式不对：应是 43 位的 base64url（xray x25519 输出的 Public key），现在是 ${n.pk.length} 位` }, 400)
-            if (!/^([0-9a-fA-F]{2}){0,8}$/.test(n.sid)) return json({ ok: false, msg: `「${name}」的 ShortId 格式不对：应是十六进制、位数为偶数、最多 16 位` }, 400)
-            n.flow = net === 'tcp' ? (v.flow || 'xtls-rprx-vision') : ''
-          }
-        } else {
-          if (v.ports) n.ports = String(v.ports).trim()
-          // 空就是不混淆。以前把空值兜底成 salamander，配上空密码，mihomo 直接拒绝整份配置
-          n.obfs = String(v.obfs || '').trim()
-          n.opwd = String(v.opwd || '').trim()
-        }
-        clean[key] = n
+        if (!/^[\w-]{1,24}$/.test(k) || BAD_KEYS.has(k)) return json({ ok: false, msg: '节点标识不合法' }, 400)
+        // Adding one node must not migrate/default-fill unrelated legacy records.
+        if (Object.prototype.hasOwnProperty.call(previous, k) && JSON.stringify(v) === JSON.stringify(previous[k])) { clean[k] = previous[k]; continue }
+        const r = normalizeOwnNode(v)
+        if (r.err) return json({ ok: false, msg: r.err, field: r.field }, 400)
+        clean[k] = r.node
       }
       // 自有节点可以一个都没有：只用机场的人本来就不需要它。
       // 以前这里要求至少留一个，结果最后一个节点怎么都删不掉
@@ -2682,13 +3072,13 @@ async function apiRoute(req, url, event) {
       if (orphan) return json({ ok: false, msg: `策略「${orphan.name}」仍引用自有节点「${orphan.key}」，请先改它的分流目标，或保留该节点后再保存` }, 400)
 
       await kvPut('nodes', clean)
-      return json({ ok: true, own: clean })
+      return json({ ok: true, own: clean, compatibility: Object.fromEntries(Object.entries(clean).map(([k, n]) => [k, ownCompatibility(n)])) })
     }
     // 顺带给每个节点一条分享链接：单独导入某个自建节点时不必去服务器上翻配置
     const own = await loadOwn()
     const links = {}
     for (const [k, n] of Object.entries(own)) { try { links[k] = shareLink({ name: n.name, own: true, o: n }) || '' } catch (e) {} }
-    return json({ ok: true, own, links })
+    return json({ ok: true, own, links, compatibility: Object.fromEntries(Object.entries(own).map(([k, n]) => [k, ownCompatibility(n)])) })
   }
   // 订阅预览：某份订阅在某种客户端格式下的完整内容。
   // 走的是订阅端点同一个 renderSub，这里看到的就是客户端拿到的。
@@ -2698,7 +3088,7 @@ async function apiRoute(req, url, event) {
     const r = await renderSub(prof, detectFmt('', url.searchParams.get('fmt') || 'clash', ''), {}, event)
     return json({
       ok: true, fmt: r.fmt, body: r.body, bytes: enc.encode(r.body).length,
-      usage: r.usage, nodes: r.nodes, policies: r.policies,
+      usage: r.usage, nodes: r.nodes, policies: r.policies, warnings: r.warnings,
       filename: (prof.name || 'subscription') + '.' + (r.ext || 'txt')
     })
   }
@@ -2945,52 +3335,13 @@ function genClash(blacklist, up, policies, lib, own, st, chains, pool) {
     usedP.add(nm); pName.set(p, nm)
   }
 
-  // 自有节点的字符串值全部 JSON 引号：short-id 0888 会被读成数字（mihomo 报 invalid REALITY short ID），
-  // 以 * & # 开头的密码会被当成别名、锚点、注释
+  // Own and upstream nodes share the same serialization and quoting rules.
   let pl = ''
-  Object.values(own).forEach(n => {
-    const L = [`  - name: ${Y(n.name)}`]
-    if (n.type === 'vless') {
-      L.push(`    type: vless`, `    server: ${Y(String(n.s))}`, `    port: ${n.p}`, `    uuid: ${Y(String(n.u))}`, `    tls: true`)
-      if (n.net === 'ws') {
-        const host = n.host || n.sni || n.s
-        L.push(
-          `    servername: ${Y(String(n.sni || n.s))}`,
-          `    client-fingerprint: chrome`,
-          `    network: ws`,
-          `    ws-opts:`,
-          `      path: ${Y(String(n.path || '/'))}`,
-          `      headers:`,
-          `        Host: ${Y(String(host))}`,
-          `      max-early-data: 2048`,
-          `      early-data-header-name: Sec-WebSocket-Protocol`)
-      } else {
-        L.push(
-          `    servername: ${Y(String(n.sni || ''))}`,
-          `    reality-opts:`,
-          `      public-key: ${Y(String(n.pk || ''))}`,
-          `      short-id: ${Y(String(n.sid || ''))}`,
-          `    client-fingerprint: chrome`,
-          ...(n.net === 'tcp'
-            ? [`    flow: ${Y(String(n.flow || ''))}`, `    network: tcp`]
-            : [`    network: xhttp`, `    xhttp-opts:`, `      path: /`, `      mode: auto`]))
-      }
-      L.push(`    udp: true`)
-    } else {
-      L.push(
-        `    type: hysteria2`,
-        `    server: ${Y(String(n.s))}`,
-        `    port: ${n.p}`,
-        ...(n.ports ? [`    ports: ${Y(String(n.ports))}`] : []),
-        `    password: ${Y(String(n.u))}`,
-        `    sni: ${Y(String(n.sni || ''))}`,
-        `    skip-cert-verify: true`,
-        `    udp: true`,
-        // 类型和密码缺一个就不写混淆：obfs 有值、obfs-password 为空时 mihomo 拒绝加载整份配置
-        ...(n.obfs && n.opwd ? [`    obfs: ${Y(String(n.obfs))}`, `    obfs-password: ${Y(String(n.opwd))}`] : []))
-    }
-    pl += L.join('\n') + '\n\n'
-  })
+  for (const n of Object.values(own)) {
+    const lines = [`  - name: ${Y(n.name)}`]
+    for (const [key, value] of Object.entries(ownToKv(n))) lines.push(`    ${key}: ${kvOut(key, value)}`)
+    pl += lines.join('\n') + '\n\n'
+  }
 
   // 机场 / 落地节点的字段原样透传。hysteria2 只写了混淆类型没给密码的，
   // 这一个节点就能让 mihomo 拒绝整份配置 —— 当作没有混淆
@@ -3277,10 +3628,16 @@ function sbTransport(net, v) {
     if (String(w['v2ray-http-upgrade']) === 'true') {
       const t = { type: 'httpupgrade', path: w.path || '/' }
       if (host) t.host = host
+      const headers = Object.fromEntries(Object.entries(w.headers || {}).filter(([key]) => key.toLowerCase() !== 'host'))
+      if (Object.keys(headers).length) t.headers = headers
       return t
     }
     const t = { type: 'ws', path: w.path || '/' }
-    if (host) t.headers = { Host: host }
+    if (w.headers && Object.keys(w.headers).length) t.headers = { ...w.headers }
+    if (Number(w['max-early-data']) > 0) {
+      t.max_early_data = Number(w['max-early-data'])
+      t.early_data_header_name = w['early-data-header-name'] || 'Sec-WebSocket-Protocol'
+    }
     return t
   }
   if (net === 'grpc') return { type: 'grpc', service_name: parseFlow(v('grpc-opts'))['grpc-service-name'] || '' }
@@ -3313,7 +3670,7 @@ const SB_SS = new Set(['aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm', 'chacha20-ie
   '2022-blake3-aes-128-gcm', '2022-blake3-aes-256-gcm', '2022-blake3-chacha20-poly1305',
   'aes-128-ctr', 'aes-192-ctr', 'aes-256-ctr', 'aes-128-cfb', 'aes-192-cfb', 'aes-256-cfb', 'rc4-md5', 'chacha20-ietf', 'xchacha20', 'none'])
 const SB_SS_ALIAS = { 'chacha20-poly1305': 'chacha20-ietf-poly1305', 'xchacha20-poly1305': 'xchacha20-ietf-poly1305', dummy: 'none', plain: 'none' }
-const SB_VMESS = new Set(['auto', 'none', 'zero', 'aes-128-cfb', 'aes-128-gcm', 'chacha20-poly1305'])
+const SB_VMESS = new Set(['auto', 'none', 'zero', 'aes-128-cfb', 'aes-128-ctr', 'aes-128-gcm', 'chacha20-poly1305'])
 
 // Clash 的 ss 插件 → sing-box 的 plugin + plugin_opts（SIP003 串，; = \ 要转义）。
 // sing-box 只内置 obfs-local 与 v2ray-plugin；shadow-tls / restls / kcptun 等返回 null，节点剔除。
@@ -3339,6 +3696,7 @@ function sbPlugin(name, o) {
 function toSB(n) {
   const v = k => n.kv[k] === undefined ? undefined : unquote(n.kv[k])
   const t = v('type')
+  if (v('fingerprint') || v('name-cert-verify')) return null
   const base = { tag: n.name, server: v('server'), server_port: parseInt(v('port'), 10) }
   if (!base.server || !(base.server_port > 0 && base.server_port < 65536)) return null
 
@@ -3348,6 +3706,7 @@ function toSB(n) {
   const ro = parseFlow(v('reality-opts'))
   const tls = { enabled: true, insecure: v('skip-cert-verify') === 'true' }
   if (sni) tls.server_name = sni
+  if (v('alpn')) tls.alpn = splitTop(v('alpn').replace(/^\[|\]$/g, '')).map(x => unquote(x.trim())).filter(Boolean)
   // mihomo 的 client-fingerprint 还可以是 none（不用 uTLS），也可能是 sing-box 不认的名字
   let fp = String(v('client-fingerprint') || '').toLowerCase()
   if (fp === 'none') fp = ''
@@ -3359,7 +3718,12 @@ function toSB(n) {
     if (!tls.utls) tls.utls = { enabled: true, fingerprint: 'chrome' }
   }
 
-  if (t === 'anytls') return { type: 'anytls', ...base, password: v('password'), tls }
+  if (t === 'anytls') {
+    const o = { type: 'anytls', ...base, password: v('password'), tls }
+    for (const [a, b] of [['idle-session-check-interval', 'idle_session_check_interval'], ['idle-session-timeout', 'idle_session_timeout']]) if (v(a)) o[b] = Number(v(a)) + 's'
+    if (v('min-idle-session') !== undefined) o.min_idle_session = Number(v('min-idle-session'))
+    return o
+  }
   if (t === 'hysteria2') {
     const o = { type: 'hysteria2', ...base, password: v('password'), tls }
     // 类型和密码缺一不可（缺密码 sing-box 报 missing obfs password）；1.12 起只认 salamander
@@ -3369,6 +3733,9 @@ function toSB(n) {
     }
     const sp = sbPorts(v('ports'))           // 端口跳跃
     if (sp.length) o.server_ports = sp
+    if (v('hop-interval')) o.hop_interval = Number(v('hop-interval')) + 's'
+    if (v('up')) o.up_mbps = Number(v('up'))
+    if (v('down')) o.down_mbps = Number(v('down'))
     return o
   }
   const tr = sbTransport(v('network'), v)
@@ -3384,6 +3751,7 @@ function toSB(n) {
     const security = String(v('cipher') || 'auto').toLowerCase()
     if (!SB_VMESS.has(security)) return null
     const o = { type: 'vmess', ...base, uuid: v('uuid'), security, alter_id: parseInt(v('alterId') || '0', 10) || 0 }
+    if (v('packet-encoding')) o.packet_encoding = v('packet-encoding')
     if (v('tls') === 'true') o.tls = tls
     if (tr) o.transport = tr
     return o
@@ -3391,12 +3759,14 @@ function toSB(n) {
   if (t === 'vless') {
     // sing-box 的流控只有 xtls-rprx-vision。udp443 变体只是多放行 UDP 443，归一过去；
     // 别的流控它不认，写进去整份配置加载失败，只能剔除
+    if (v('encryption') && v('encryption') !== 'none') return null
     let flow = v('flow') || ''
     if (flow === 'xtls-rprx-vision-udp443') flow = 'xtls-rprx-vision'
     if (flow && flow !== 'xtls-rprx-vision') return null
-    const o = { type: 'vless', ...base, uuid: v('uuid'), packet_encoding: 'xudp' }
+    const o = { type: 'vless', ...base, uuid: v('uuid') }
+    if (v('packet-encoding') !== '') o.packet_encoding = v('packet-encoding') || 'xudp'
     if (flow) o.flow = flow
-    if (v('tls') === 'true' || tls.reality || sni) o.tls = tls
+    if (v('tls') === 'true' || tls.reality || (sni && v('tls') !== 'false')) o.tls = tls
     if (tr) o.transport = tr
     return o
   }
@@ -3405,6 +3775,7 @@ function toSB(n) {
     const method = SB_SS_ALIAS[raw] || raw
     if (!SB_SS.has(method)) return null
     const o = { type: 'shadowsocks', ...base, method, password: v('password') }
+    if (v('udp-over-tcp') === 'true') o.udp_over_tcp = { enabled: true, version: Number(v('udp-over-tcp-version') || 2) }
     if (v('plugin')) {
       const p = sbPlugin(v('plugin'), parseFlow(v('plugin-opts')))
       if (!p) return null
@@ -3417,29 +3788,10 @@ function toSB(n) {
 
 // 自有节点 → sing-box outbound；转不出的返回 null（调用方连同分组引用一起剔除）
 function ownToSB(n) {
-  if (n.type === 'vless') {
-    if (n.net === 'ws') {
-      const host = n.host || n.sni || n.s
-      return { type: 'vless', tag: n.name, server: n.s, server_port: n.p, uuid: n.u, packet_encoding: 'xudp', tls: { enabled: true, server_name: n.sni || n.s, utls: { enabled: true, fingerprint: 'chrome' } }, transport: { type: 'ws', path: n.path || '/', headers: { Host: host }, max_early_data: 2048, early_data_header_name: 'Sec-WebSocket-Protocol' } }
-    }
-    // xhttp：sing-box 没有这个传输，写 {type:'xhttp'} 整份配置加载失败 —— 剔除
-    if (n.net !== 'tcp') return null
-    let flow = n.flow || ''
-    if (flow === 'xtls-rprx-vision-udp443') flow = 'xtls-rprx-vision'
-    if (flow && flow !== 'xtls-rprx-vision') return null
-    // tcp 不写 transport：sing-box 没有叫 tcp 的 transport，写了报 unknown transport type
-    const o = { type: 'vless', tag: n.name, server: n.s, server_port: n.p, uuid: n.u, packet_encoding: 'xudp', tls: { enabled: true, server_name: n.sni, utls: { enabled: true, fingerprint: 'chrome' }, reality: { enabled: true, public_key: n.pk, short_id: n.sid } } }
-    if (flow) o.flow = flow
-    return o
-  }
-  const o = { type: 'hysteria2', tag: n.name, server: n.s, server_port: n.p, password: n.u, tls: { enabled: true, server_name: n.sni, insecure: true } }
-  if (n.obfs && n.opwd) {
-    if (n.obfs !== 'salamander') return null
-    o.obfs = { type: 'salamander', password: n.opwd }
-  }
-  const sp = sbPorts(n.ports)
-  if (sp.length) o.server_ports = sp
-  return o
+  if (!n || !OWN_TYPES.includes(n.type)) return null
+  const outbound = toSB({ name: n.name, kv: ownToKv(n) })
+  if (outbound && n.udp === false) outbound.network = 'tcp'
+  return outbound
 }
 
 // DNS 地址（与 Clash 共用的那套写法）→ sing-box 1.12 起的 DNS server。
@@ -3642,37 +3994,11 @@ function srWsParams(net, ws) {
 }
 
 function ownToSR(n) {
-  if (!n) return null
-  if (n.type === 'vless') {
-    if (!srNetOk(n.net)) return null
-    if (!n.u || !n.s || !n.p) return null
-    const params = [
-      srParam('password', n.u),
-      'udp=true',
-      'tls=true',
-      n.sni ? srParam('peer', n.sni) : null,
-      n.pk ? srParam('public-key', n.pk) : null,
-      n.sid ? srParam('short-id', n.sid) : null,
-      n.flow ? srParam('flow', n.flow) : null,
-      ...srWsParams(n.net, { path: n.path, headers: n.host ? { Host: n.host } : undefined })
-    ]
-    return srLine(n.name, 'vless', n.s, n.p, params)
-  }
-  if (n.type === 'hysteria2' || n.type === 'hy2') {
-    if (!n.u || !n.s || !n.p) return null
-    const params = [
-      srParam('auth', n.u),
-      n.sni ? srParam('peer', n.sni) : null,
-      'insecure=true',
-      'udp=true',
-      // 混淆类型与密码缺一不可，只有一半等于配错
-      n.obfs && n.opwd ? srParam('obfs', n.obfs) : null,
-      n.obfs && n.opwd ? srParam('obfs-password', n.opwd) : null,
-      n.ports ? srParam('mport', n.ports) : null
-    ]
-    return srLine(n.name, 'hysteria2', n.s, n.p, params)
-  }
-  return null
+  if (!n || !OWN_TYPES.includes(n.type)) return null
+  if (n.certSha256 || n.verifyName) return null
+  if (ownSRUnsafeField(n)) return null
+  if (n.type === 'vless' && n.encryption && n.encryption !== 'none') return null
+  return airportToSR({ name: n.name, kv: ownToKv(n) })
 }
 
 function airportToSR(n) {
@@ -3703,10 +4029,11 @@ function airportToSR(n) {
   if (t === 'vmess') {
     if (!srNetOk(net)) return null
     if (!v('uuid')) return null
-    const tls = v('tls') === 'true' || !!sni
+    const tls = v('tls') === 'true' || (!!sni && v('tls') !== 'false')
     return srLine(n.name, 'vmess', server, port, [
       srParam('username', v('uuid')),
       tls ? 'tls=true' : 'tls=false',
+      insecure ? 'insecure=true' : null,
       sni ? srParam('peer', sni) : null,
       ...(String(net).toLowerCase() === 'ws' ? srWsParams(net, ws) : ['obfs=none']),
       udp ? 'udp=true' : null
@@ -3716,11 +4043,12 @@ function airportToSR(n) {
     if (!srNetOk(net)) return null
     if (!v('uuid')) return null
     const isReality = !!ro['public-key']
-    const tls = v('tls') === 'true' || isReality || !!sni
+    const tls = v('tls') === 'true' || isReality || (!!sni && v('tls') !== 'false')
     return srLine(n.name, 'vless', server, port, [
       srParam('password', v('uuid')),
       udp ? 'udp=true' : null,
-      tls ? 'tls=true' : null,
+      tls ? 'tls=true' : 'tls=false',
+      insecure ? 'insecure=true' : null,
       sni ? srParam('peer', sni) : null,
       ro['public-key'] ? srParam('public-key', ro['public-key']) : null,
       ro['short-id'] ? srParam('short-id', ro['short-id']) : null,
@@ -3747,7 +4075,7 @@ function airportToSR(n) {
       srParam('auth', pwd),
       sni ? srParam('peer', sni) : null,
       insecure ? 'insecure=true' : null,
-      'udp=true',
+      'udp=' + String(udp),
       v('obfs') && v('obfs-password') ? srParam('obfs', v('obfs')) : null,
       v('obfs') && v('obfs-password') ? srParam('obfs-password', v('obfs-password')) : null,
       v('ports') ? srParam('mport', v('ports')) : null
@@ -3897,26 +4225,29 @@ function hostPart(h) {
 function shareLink(n) {
   const tag = encodeURIComponent(n.name)
   if (n.own) {
-    const o = n.o
-    if (o.type === 'vless') {
-      const qs = new URLSearchParams({ encryption: 'none' })
-      if (o.net === 'ws') {
-        // ws 节点走的是普通 TLS，不是 Reality。以前这里一律按 Reality 导出，
-        // 带着 pbk=undefined、type=xhttp，导进任何客户端都连不上
-        qs.set('security', 'tls'); qs.set('sni', o.sni || o.s); qs.set('fp', 'chrome')
-        qs.set('type', 'ws'); qs.set('path', o.path || '/'); qs.set('host', o.host || o.sni || o.s)
-      } else {
-        qs.set('security', 'reality'); qs.set('sni', o.sni || ''); qs.set('fp', 'chrome')
-        qs.set('pbk', o.pk || ''); qs.set('sid', o.sid || '')
-        if (o.net === 'tcp') { qs.set('type', 'tcp'); if (o.flow) qs.set('flow', o.flow) }
-        else { qs.set('type', 'xhttp'); qs.set('path', '/'); qs.set('mode', 'auto') }
+    const link = shareLink({ name: n.name, kv: ownToKv(n.o) })
+    const extras = n.o.importExtras
+    if (!link || !extras) return link
+    if (n.o.type === 'vmess') {
+      const current = JSON.parse(b64decode(link.slice(8)))
+      const query = Object.create(null)
+      for (const [key,value] of extras.query || []) {
+        if (BAD_KEYS.has(key) || reservedImportQuery(n.o.type,key) || IMPORT_VMESS_FIELDS.has(key)) continue
+        if (!Object.prototype.hasOwnProperty.call(query,key)) query[key] = value
+        else query[key] = [].concat(query[key],value)
       }
-      return `vless://${encodeURIComponent(o.u)}@${hostPart(o.s)}:${o.p}?${qs}#${tag}`
+      const additional = Object.fromEntries(Object.entries(extras.vmess || {}).filter(([key]) => !BAD_KEYS.has(key) && !IMPORT_VMESS_FIELDS.has(key)))
+      return 'vmess://' + b64utf8(JSON.stringify({ ...additional, ...query, ...current }))
     }
-    const qs = new URLSearchParams({ sni: o.sni || '', insecure: '1' })
-    if (o.obfs && o.opwd) { qs.set('obfs', o.obfs); qs.set('obfs-password', o.opwd) }
-    if (o.ports) qs.set('mport', o.ports)
-    return `hysteria2://${encodeURIComponent(o.u)}@${hostPart(o.s)}:${o.p}?${qs}#${tag}`
+    const url = new URL(link)
+    const generated = new Set(url.searchParams.keys())
+    for (const [key, value] of extras.query || []) if (!generated.has(key) && !BAD_KEYS.has(key) && !reservedImportQuery(n.o.type,key)) url.searchParams.append(key, value)
+    if (n.o.type === 'ss' && extras.plugin && Object.keys(extras.plugin).length) {
+      const esc = s => String(s).replace(/[\\;=]/g, '\\$&')
+      const tail = Object.entries(extras.plugin).filter(([key]) => !BAD_KEYS.has(key) && !IMPORT_PLUGIN_FIELDS.has(key)).map(([key, value]) => esc(key) + (value === '' ? '' : '=' + esc(value))).join(';')
+      if (url.searchParams.has('plugin')) url.searchParams.set('plugin', url.searchParams.get('plugin') + ';' + tail)
+    }
+    return url.href
   }
   // 上游节点：这里是 parseShareLine 的逆运算，两边字段映射必须对得上，
   // 否则「订阅进来能用、导出去连不上」。
@@ -3935,6 +4266,10 @@ function shareLink(n) {
   const qs = new URLSearchParams()
   if (sni) qs.set('sni', sni)
   if (v('skip-cert-verify') === 'true') { qs.set('insecure', '1'); qs.set('allowInsecure', '1') }
+  if (v('client-fingerprint')) qs.set('fp', v('client-fingerprint'))
+  if (v('alpn')) qs.set('alpn', splitTop(v('alpn').replace(/^\[|\]$/g, '')).map(x => unquote(x.trim())).join(','))
+  if (v('name-cert-verify')) qs.set('vcn', v('name-cert-verify'))
+  if (v('fingerprint')) qs.set('pinSHA256', v('fingerprint'))
   // 传输层参数不带上，ws / grpc / h2 / xhttp 节点导进客户端照样连不上
   const addTransport = () => {
     if (net === 'ws') {
@@ -3965,7 +4300,9 @@ function shareLink(n) {
   if (t === 'trojan')    { addTransport(); return `trojan://${encodeURIComponent(pwd)}@${hostPart(host)}:${port}?${qs}#${tag}` }
   if (t === 'ss') {
     // SIP002：userinfo 用 URL 安全的 base64、不带 padding。标准 base64 里的 / 会截断主机部分
-    const ui = b64utf8(v('cipher') + ':' + pwd).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    const ui = String(v('cipher')).startsWith('2022-')
+      ? encodeURIComponent(v('cipher')) + ':' + encodeURIComponent(pwd)
+      : b64utf8(v('cipher') + ':' + pwd).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
     let plug = ''
     if (v('plugin')) {
       // 插件参数丢了，导出去的节点必然连不上；认不出的插件干脆不导出
@@ -3982,7 +4319,7 @@ function shareLink(n) {
   }
   if (t === 'vless') {
     if (!v('uuid')) return null
-    qs.set('encryption', 'none')
+    qs.set('encryption', v('encryption') || 'none')
     qs.set('security', ro['public-key'] ? 'reality' : (v('tls') === 'true' ? 'tls' : 'none'))
     if (v('flow')) qs.set('flow', v('flow'))
     if (v('client-fingerprint')) qs.set('fp', v('client-fingerprint'))
@@ -3991,6 +4328,7 @@ function shareLink(n) {
       if (ro['short-id']) qs.set('sid', ro['short-id'])
     }
     addTransport()
+    if (!qs.has('type')) qs.set('type', 'tcp')
     return `vless://${v('uuid')}@${hostPart(host)}:${port}?${qs}#${tag}`
   }
   if (t === 'vmess') {
@@ -4000,10 +4338,17 @@ function shareLink(n) {
       aid: v('alterId') || '0', scy: v('cipher') || 'auto',
       net, type: 'none', host: wsHost || '', path: ws.path || '',
       tls: v('tls') === 'true' ? 'tls' : '', sni: sni || '' }
+    if (v('client-fingerprint')) j.fp = v('client-fingerprint')
+    if (v('alpn')) j.alpn = splitTop(v('alpn').replace(/^\[|\]$/g, '')).map(x => unquote(x.trim())).join(',')
+    if (v('skip-cert-verify') === 'true') j.allowInsecure = true
+    j.insecure = v('skip-cert-verify') === 'true' ? '1' : '0'
+    if (v('name-cert-verify')) j.vcn = v('name-cert-verify')
+    if (v('fingerprint')) j.pcs = v('fingerprint')
     if (net === 'ws' && upgrade) j.net = 'httpupgrade'
     else if (net === 'grpc') j.path = grpcName || ''
     else if (net === 'h2') { j.host = list(h2.host).join(','); j.path = list(h2.path)[0] || '' }
     else if (net === 'http') { j.net = 'tcp'; j.type = 'http'; j.host = hoHost.join(','); j.path = list(ho.path).join(',') }
+    else if (net === 'xhttp') { j.path = xh.path || '/'; j.host = xh.host || ''; j.mode = xh.mode || 'auto' }
     return 'vmess://' + b64utf8(JSON.stringify(j))
   }
   return null
@@ -4014,6 +4359,201 @@ function genShare(up, ownCfg, st) {
   const own = Object.values(ownCfg || {}).map(o => ({ name: o.name, own: true, o: { ...o, s: o.s } }))
   const links = [...own, ...up].map(shareLink).filter(Boolean)
   return b64utf8(links.join('\n'))
+}
+
+// Installed into the existing page scope; keeping this as JS avoids nested-template escaping bugs.
+function installOwnEditor() {
+  const types = [{ v: 'vless', label: 'VLESS' }, { v: 'hysteria2', label: 'Hysteria2' }, { v: 'ss', label: 'Shadowsocks' }, { v: 'vmess', label: 'VMess' }, { v: 'anytls', label: 'AnyTLS' }]
+  const networks = [{ v: 'tcp', label: 'TCP / RAW' }, {v:'ws',label:'WebSocket + TLS（可套 CDN）'}, { v: 'httpupgrade', label: 'HTTPUpgrade' }, { v: 'grpc', label: 'gRPC' }, { v: 'h2', label: 'HTTP/2' }, { v: 'http', label: 'TCP + HTTP 伪装' }, { v: 'xhttp', label: 'XHTTP' }]
+  const defaults = type => ({ name: '', type, s: '', p: 443, u: '', sni: '', security: type === 'ss' ? 'none' : type === 'vless' ? 'reality' : 'tls', net: 'tcp', packetEncoding: type === 'vless' ? 'xudp' : '', flow: type === 'vless' ? 'xtls-rprx-vision' : '', cipher: type === 'ss' ? 'aes-128-gcm' : 'auto', fp: 'chrome', alpn: [], insecure: false, udp: true, path: '/', host: '', pk: '', sid: '', plugin: '', pluginOpts: {}, obfs: '', opwd: '', ports: '' })
+  window.editOwn = async (key) => {
+    const isNew = key === null, ow = (OWN && OWN.own) || {}
+    const original = isNew ? defaults('vless') : JSON.parse(JSON.stringify(ow[key]))
+    if (!original) return toast('节点不存在，请刷新后重试', true)
+    const n = { ...defaults(original.type), ...original }
+    if (n.type === 'vless' && original.packetEncoding === undefined) n.packetEncoding = 'xudp'
+    if (original.security === undefined && !isNew) {
+      n.security = n.type === 'vless' ? (n.net === 'ws' ? 'tls' : 'reality') : ['vmess','ss'].includes(n.type) ? 'none' : 'tls'
+      if (original.insecure === undefined) n.insecure = n.type === 'hysteria2'
+      if (original.fp === undefined && n.type !== 'vless') n.fp = 'none'
+      if (n.type === 'vless' && n.net === 'ws' && n.earlyData === undefined) n.earlyData = 2048
+    }
+    const input = (id, label, value = '', extra = '') => `<div class="fg"><label class="lb" for="${id}">${label}</label><input id="${id}" class="mono" value="${esc(String(value ?? ''))}" autocomplete="off" spellcheck="false" ${extra}></div>`
+    const select = (id, label, options, value) => `<div class="fg"><label class="lb">${label}</label>${selectHTML(id, options, value)}</div>`
+    const toggle = (id, label, checked) => `<label class="own-check" for="${id}"><input id="${id}" type="checkbox" ${checked ? 'checked' : ''}><span class="own-check-box" aria-hidden="true"></span><span>${label}</span></label>`
+    const numeric = 'type="number" min="0" step="1"'
+    const html = `
+      ${isNew ? `<div class="fg"><label class="lb" for="oimp">从分享链接导入<span class="opt">可选</span></label><div class="row"><input id="oimp" class="mono" placeholder="vless://、hy2://、ss://、vmess://、anytls://" autocomplete="off"><button type="button" class="g" id="oimpb">解析填充</button></div></div><hr class="fsep">` : ''}
+      ${input('on', '节点名称', n.name, 'maxlength="32"')}
+      ${select('ot', '协议', types, n.type)}
+      <div class="own-fields own-address">${input('os', '服务器地址（支持 IPv6）', n.s)}${input('op', '端口', n.p, 'type="number" min="1" max="65535" step="1"')}</div>
+      ${input('ou', 'UUID / 认证密码', n.u)}
+      <div id="fcipher">${select('ocipher', '加密方式', [{v:'auto',label:'auto'},{v:'none',label:'none'},{v:'zero',label:'zero'}, ...['aes-128-gcm','aes-192-gcm','aes-256-gcm','chacha20-poly1305','chacha20-ietf-poly1305','xchacha20-ietf-poly1305','2022-blake3-aes-128-gcm','2022-blake3-aes-256-gcm','2022-blake3-chacha20-poly1305','aes-128-ctr','aes-192-ctr','aes-256-ctr','aes-128-cfb','aes-192-cfb','aes-256-cfb','aes-128-ccm','aes-192-ccm','aes-256-ccm','aes-128-gcm-siv','aes-256-gcm-siv','chacha20-ietf','chacha20','xchacha20','chacha8-ietf-poly1305','xchacha8-ietf-poly1305','lea-128-gcm','lea-192-gcm','lea-256-gcm','rabbit128-poly1305','aegis-128l','aegis-256','aez-384','deoxys-ii-256-128','rc4-md5'].map(v => ({v,label:v}))], n.cipher)}</div>
+      <div id="fsecurity">${select('osecurity', '连接安全', [{v:'reality',label:'Reality'},{v:'tls',label:'TLS'},{v:'none',label:'不加密（仅可信内网 / VLESS Encryption）'}], n.security)}</div>
+      <div id="ftls">${input('osni', 'SNI / TLS 服务器名称', n.sni)}</div>
+      <div id="ftransport">${select('onet', '传输方式', networks, n.net)}
+        <div id="fr"><div class="own-fields">${input('opk', 'Reality 公钥', n.pk)}${input('osid', 'ShortId', n.sid)}</div></div>
+        <div id="fw"><div class="own-fields">${input('opath', '传输路径', n.path || '/')}${input('ohost', 'Host（留空使用 SNI）', n.host)}</div></div>
+        <div id="fgrpc">${input('ogrpc', 'gRPC ServiceName', n.serviceName)}</div>
+        <div id="fxmode">${select('omode', 'XHTTP 模式', ['auto','packet-up','stream-up','stream-one'].map(v => ({v,label:v})), n.mode || 'auto')}</div>
+      </div>
+      <details class="fg" id="ownadvanced" ${!isNew ? 'open' : ''}><summary class="lb" style="cursor:pointer;padding:8px 0">高级配置</summary>
+        <div class="hint" id="ohelp">兼容提示：不支持的字段会保留在本站，并在订阅预览标明；不会伪装成其他协议。</div>
+        <div id="fvtls"><div id="ffp">${select('ofp', '客户端指纹', ['chrome','chrome_psk','chrome_psk_shuffle','chrome_padding_psk_shuffle','chrome_pq','chrome_pq_psk','firefox','edge','safari','360','qq','ios','android','random','randomized','none'].map(v => ({v,label:v})), n.fp || 'none')}</div>${input('oalpn', 'ALPN（逗号分隔）', (n.alpn || []).join(','))}${toggle('oinsecure', '跳过证书校验（不推荐）', n.insecure)}${input('overifyname', '证书校验域名（vcn，可选）', n.verifyName)}${input('ocertsha256', '证书 SHA256 指纹（pcs / pinSHA256，可选）', n.certSha256)}<div class="hint">这是完整证书的 SHA256，不是公钥指纹。Clash 支持；旧版 sing-box 无法表示时不会弱化校验强行下发。</div></div>
+        ${toggle('oudp', '启用 UDP', n.udp !== false)}
+        <div id="fvless">${input('oencryption', 'VLESS Encryption（禁用填 none）', n.encryption || 'none')}${select('oflow', 'Flow 流控', [{v:'',label:'不启用 Flow'},{v:'xtls-rprx-vision',label:'xtls-rprx-vision'},{v:'xtls-rprx-vision-udp443',label:'xtls-rprx-vision-udp443'}], n.flow || '')}</div>
+        <div id="fpacket">${select('opacket', 'UDP 包编码', [{v:'',label:'默认 / 原始'},{v:'xudp',label:'xudp'},{v:'packetaddr',label:'packetaddr'}], n.packetEncoding || '')}</div>
+        <div id="fvmess">${input('oalter', 'AlterID（推荐 0 / AEAD）', n.alterId ?? 0, numeric)}</div>
+        <div id="fwsadvanced">${input('oearly', 'WebSocket Early Data（字节，可留空）', n.earlyData, numeric)}${input('oearlyheader', 'Early Data 请求头', n.earlyDataHeader || 'Sec-WebSocket-Protocol')}<div class="fg"><label class="lb" for="oheaders">其他 WS 请求头（可选 JSON）</label><textarea id="oheaders" placeholder='{"X-Example":"value"}'>${esc(JSON.stringify(n.headers || {}))}</textarea></div></div>
+        <div id="fh"><div class="own-fields">${input('oports', 'HY2 端口跳跃（如 443,20000-20100）', n.ports)}${input('ohop', '跳跃间隔（秒，可留空）', n.hopInterval, numeric)}</div><div class="own-fields">${input('oup', '上行带宽（Mbps）', n.upMbps, 'type="number" min="0.001" step="any"')}${input('odown', '下行带宽（Mbps）', n.downMbps, 'type="number" min="0.001" step="any"')}</div>${select('oobfs', '混淆类型', [{v:'',label:'不启用混淆'},{v:'salamander',label:'Salamander'}], n.obfs || '')}${input('oopwd', '混淆密码', n.opwd)}</div>
+        <div id="fss">${toggle('ouot', '启用 UDP-over-TCP', n.uot)}${select('ouotversion', 'UDP-over-TCP 版本', [{v:'2',label:'2'},{v:'1',label:'1'}], String(n.uotVersion || 2))}${select('oplugin', 'SS 插件', [{v:'',label:'不使用插件'},{v:'obfs',label:'simple-obfs'},{v:'v2ray-plugin',label:'v2ray-plugin'}], n.plugin || '')}<div id="fplugin">${select('opluginmode', '插件模式', [{v:'websocket',label:'WebSocket（v2ray-plugin）'},{v:'http',label:'HTTP（obfs）'},{v:'tls',label:'TLS（obfs）'}], n.pluginOpts?.mode || (n.plugin === 'obfs' ? 'http' : 'websocket'))}${input('opluginhost', '插件 Host', n.pluginOpts?.host)}${input('opluginpath', '插件路径', n.pluginOpts?.path || '/')}${toggle('oplugintls', '插件 TLS', String(n.pluginOpts?.tls) === 'true')}${toggle('opluginmux', '插件 Mux', String(n.pluginOpts?.mux) === 'true')}</div></div>
+        <div id="fanytls"><div class="own-fields">${input('oidlecheck', '空闲会话检查间隔（秒）', n.idleCheck, numeric)}${input('oidletimeout', '空闲会话超时（秒）', n.idleTimeout, numeric)}</div>${input('ominidle', '最少保留的空闲会话数量', n.minIdle, numeric)}</div>
+        <div class="fg" id="fimportextras" ${n.importExtras ? '' : 'hidden'}><label class="lb" for="oimportextras">导入扩展字段（JSON，原样保留）</label><textarea id="oimportextras" spellcheck="false">${esc(JSON.stringify(n.importExtras || {}))}</textarea><div class="hint">这些字段不会导致整条链接被拒绝。当前完整配置未必支持，请核对兼容提示；分享链接会尽量原样保留。字段可能包含敏感信息，请勿截图外发。</div></div>
+      </details>
+      ${isNew ? '' : `<div class="fg"><label class="lb">节点标识（自动生成，不可改）</label><input class="mono" value="${esc(key)}" disabled></div>`}`
+    let readForm
+    const box = await modal({ title: isNew ? '添加自有节点' : '编辑自有节点', html, ok: '保存', wide: true, onMount: b => {
+      bindSelect(b)
+      b.querySelectorAll('.sel').forEach(s => s.querySelector('.selb').setAttribute('aria-label', s.closest('.fg').querySelector('label')?.textContent || s.id))
+      const get = id => b.querySelector('#' + id)
+      const val = id => get(id).value.trim(), pick = id => selValue(get(id))
+      const choose = (id, value) => {
+        const sel = get(id), opt = [...(sel._pop || sel).querySelectorAll('.selo')].find(x => x.dataset.v === String(value))
+        if (opt && pick(id) !== String(value)) opt.click()
+      }
+      let active = n.type, filling = false
+      const drafts = { [active]: n }
+      readForm = (type = pick('ot')) => {
+        const d = { name: val('on'), type, s: val('os'), p: val('op'), u: get('ou').value, sni: type === 'ss' ? '' : val('osni'), security: type === 'ss' ? 'none' : ['anytls','hysteria2'].includes(type) ? 'tls' : pick('osecurity'), udp: get('oudp').checked }
+        const readJSON = id => { try { return JSON.parse(get(id).value || '{}') } catch (e) { e.field = id; throw e } }
+        const extra = readJSON('oimportextras')
+        if (Object.keys(extra).length) d.importExtras = extra
+        if (['vless','vmess'].includes(type)) {
+          Object.assign(d, { net: pick('onet'), path: val('opath'), host: val('ohost'), serviceName: val('ogrpc'), mode: pick('omode'), packetEncoding: pick('opacket') })
+          if (['ws','httpupgrade'].includes(d.net)) {
+            d.headers = readJSON('oheaders')
+            if (val('oearly') !== '') { d.earlyData = Number(val('oearly')); d.earlyDataHeader = val('oearlyheader') }
+          }
+        }
+        if (type !== 'ss') Object.assign(d, { fp: type === 'hysteria2' ? 'none' : pick('ofp'), alpn: val('oalpn').split(',').map(x => x.trim()).filter(Boolean), insecure: get('oinsecure').checked, verifyName:val('overifyname'), certSha256:val('ocertsha256') })
+        if (type === 'vless') Object.assign(d, { pk: val('opk'), sid: val('osid'), flow: pick('oflow'), encryption: val('oencryption') || 'none' })
+        if (type === 'vmess') { d.cipher = pick('ocipher'); d.alterId = Number(val('oalter')) }
+        if (type === 'ss') {
+          Object.assign(d, { cipher: pick('ocipher'), uot: get('ouot').checked, uotVersion: Number(pick('ouotversion')), plugin: pick('oplugin'), pluginOpts: {} })
+          if (d.plugin) {
+            d.pluginOpts = { mode: pick('opluginmode'), host: val('opluginhost') }
+            if (d.plugin === 'v2ray-plugin') Object.assign(d.pluginOpts, { path: val('opluginpath') || '/', tls: get('oplugintls').checked, mux: get('opluginmux').checked })
+          }
+        }
+        if (type === 'hysteria2') {
+          Object.assign(d, { ports: val('oports'), obfs: pick('oobfs'), opwd: get('oopwd').value })
+          for (const [k, id] of [['hopInterval','ohop'],['upMbps','oup'],['downMbps','odown']]) if (val(id) !== '') d[k] = Number(val(id))
+        }
+        if (type === 'anytls') for (const [k, id] of [['idleCheck','oidlecheck'],['idleTimeout','oidletimeout'],['minIdle','ominidle']]) if (val(id) !== '') d[k] = Number(val(id))
+        return d
+      }
+      const fill = data => {
+        filling = true
+        for (const [id, k] of [['on','name'],['os','s'],['op','p'],['ou','u'],['osni','sni'],['opk','pk'],['osid','sid'],['opath','path'],['ohost','host'],['ogrpc','serviceName'],['oencryption','encryption'],['oearly','earlyData'],['oearlyheader','earlyDataHeader'],['oalter','alterId'],['oports','ports'],['ohop','hopInterval'],['oup','upMbps'],['odown','downMbps'],['oopwd','opwd'],['oidlecheck','idleCheck'],['oidletimeout','idleTimeout'],['ominidle','minIdle']]) get(id).value = data[k] ?? (k === 'encryption' ? 'none' : k === 'p' ? 443 : k === 'path' ? '/' : k === 'alterId' ? 0 : '')
+        get('oalpn').value = (data.alpn || []).join(','); get('oheaders').value = JSON.stringify(data.headers || {})
+        get('overifyname').value = data.verifyName || ''; get('ocertsha256').value = data.certSha256 || ''
+        get('oimportextras').value = JSON.stringify(data.importExtras || {})
+        get('fimportextras').hidden = !data.importExtras
+        for (const [id, k] of [['ot','type'],['osecurity','security'],['onet','net'],['oflow','flow'],['ofp','fp'],['ocipher','cipher'],['omode','mode'],['opacket','packetEncoding'],['oobfs','obfs'],['oplugin','plugin']]) choose(id, data[k] ?? (k === 'security' ? 'tls' : k === 'net' ? 'tcp' : k === 'mode' ? 'auto' : k === 'fp' ? 'none' : k === 'cipher' ? 'auto' : ''))
+        choose('ouotversion', data.uotVersion || 2)
+        const po = data.pluginOpts || {}
+        choose('opluginmode', po.mode || (data.plugin === 'obfs' ? 'http' : 'websocket'))
+        for (const [id, k] of [['opluginhost','host'],['opluginpath','path']]) get(id).value = po[k] || (k === 'path' ? '/' : '')
+        get('oplugintls').checked = String(po.tls) === 'true'; get('opluginmux').checked = String(po.mux) === 'true'
+        for (const [id, k] of [['oinsecure','insecure'],['oudp','udp'],['ouot','uot']]) get(id).checked = k === 'udp' ? data[k] !== false : !!data[k]
+        filling = false
+      }
+      const sync = () => {
+        if (filling) return
+        const t = pick('ot')
+        if (t !== active) {
+          let previous
+          try { previous = readForm(active) } catch (e) {
+            choose('ot', active)
+            const field = get(e.field || 'oheaders')
+            field.classList.add('bad'); field.setAttribute('aria-invalid', 'true')
+            if (!field.parentElement.querySelector('.ferr')) {
+              const tip = document.createElement('div'); tip.className = 'ferr'; tip.textContent = '高级 JSON 尚未写完，请修正后再切换协议；当前草稿已保留。'; field.parentElement.appendChild(tip)
+            }
+            get('ownadvanced').open = true
+            return
+          }
+          drafts[active] = previous
+          const next = drafts[t] || { ...defaults(t), name: val('on'), s: val('os'), p: val('op'), sni: val('osni') }
+          active = t; fill(next)
+        }
+        const transport = ['vless','vmess'].includes(t), sec = ['anytls','hysteria2'].includes(t) ? 'tls' : pick('osecurity'), net = pick('onet')
+        const hide = (id, value) => { get(id).hidden = value }
+        hide('fcipher', !['ss','vmess'].includes(t)); hide('fsecurity', !transport)
+        hide('ftls', t === 'ss' || sec === 'none'); hide('fvtls', t === 'ss' || sec === 'none')
+        hide('ffp', t === 'hysteria2')
+        hide('ftransport', !transport); hide('fr', t !== 'vless' || sec !== 'reality')
+        hide('fw', !transport || !['ws','httpupgrade','h2','http','xhttp'].includes(net)); hide('fgrpc', !transport || net !== 'grpc'); hide('fxmode', !transport || net !== 'xhttp')
+        hide('fvless', t !== 'vless'); hide('fvmess', t !== 'vmess'); hide('fpacket', !transport)
+        hide('fwsadvanced', !transport || !['ws','httpupgrade'].includes(net)); hide('fh', t !== 'hysteria2'); hide('fss', t !== 'ss'); hide('fanytls', t !== 'anytls'); hide('fplugin', !pick('oplugin'))
+        const cipherOptions = get('ocipher')._pop.querySelectorAll('.selo')
+        cipherOptions.forEach(opt => { opt.hidden = t === 'vmess' ? !['auto','none','zero','aes-128-gcm','chacha20-poly1305','aes-128-ctr','aes-128-cfb'].includes(opt.dataset.v) : ['auto','zero','chacha20-poly1305'].includes(opt.dataset.v) })
+        get('osecurity')._pop.querySelectorAll('.selo').forEach(opt => { opt.hidden = t === 'vmess' && opt.dataset.v === 'reality' })
+        get('ou').previousElementSibling.textContent = transport ? 'UUID' : t === 'hysteria2' ? '认证密码（支持 username:password）' : '密码 / 密钥'
+        if (t === 'vmess' && !['auto','none','zero','aes-128-gcm','chacha20-poly1305','aes-128-ctr','aes-128-cfb'].includes(pick('ocipher'))) choose('ocipher','auto')
+        if (t === 'ss' && ['auto','zero','chacha20-poly1305'].includes(pick('ocipher'))) choose('ocipher','aes-128-gcm')
+        if (t === 'ss' && pick('oplugin') === 'obfs' && pick('opluginmode') === 'websocket') choose('opluginmode','http')
+        if (t === 'ss' && pick('oplugin') === 'v2ray-plugin' && pick('opluginmode') !== 'websocket') choose('opluginmode','websocket')
+        if (t === 'vmess' && sec === 'reality') choose('osecurity','tls')
+        get('ohelp').textContent = '兼容提示：' + (net === 'xhttp' && transport ? 'XHTTP 不支持 sing-box / Shadowrocket 原生 conf；该节点在这些格式中会被剔除。' : '高级参数按客户端能力导出，通用分享链接未必能携带全部参数，请查看订阅预览的提示。')
+      }
+      b.querySelectorAll('.selo').forEach(opt => opt.addEventListener('click', () => setTimeout(sync, 0)))
+      sync()
+      const impb = get('oimpb')
+      if (impb) impb.addEventListener('click', async () => {
+        b.querySelectorAll('.ferr').forEach(e => e.remove())
+        const field = get('oimp'), say = text => { const tip = document.createElement('div'); tip.className = 'ferr'; tip.textContent = text; field.closest('.fg').appendChild(tip) }
+        const link = field.value.trim()
+        if (!link) return say('先粘贴一条分享链接')
+        impb.disabled = true
+        let r
+        try { r = await api('/api/parse-share', { link }) } finally { impb.disabled = false }
+        if (!r || !r.ok) return say(r?.msg || '解析失败')
+        const imported = { ...defaults(r.node.type), ...r.node }
+        if (imported.importExtras || imported.verifyName || imported.certSha256 || imported.warn) get('ownadvanced').open = true
+        drafts[imported.type] = imported; active = imported.type; fill(imported); sync()
+        say(imported.warn || '已填好，核对后保存')
+      })
+    }, onSubmit: async b => {
+      let np
+      try { np = readForm() } catch (e) { return { msg: '高级 JSON 格式不正确', field: e.field || 'oheaders' } }
+      if (!np.name) return { msg: '请填写节点名称', field:'on' }
+      if (!np.s) return { msg: '请填写服务器地址', field:'os' }
+      if (!/^\d+$/.test(np.p) || +np.p < 1 || +np.p > 65535) return { msg: '端口要是 1-65535 的数字', field:'op' }
+      if (!np.u) return { msg: '请填写 UUID / 认证密码', field:'ou' }
+      const fresh = await api('/api/own')
+      if (!fresh || !fresh.ok) return '读取自有节点失败，请刷新后重试'
+      const base = fresh.own || {}
+      // 已有节点的标识保持不变，否则策略会失效。
+      let k = key
+      if (!k) {
+        const prefix = 'n' + Math.abs([...np.name].reduce((x, c) => x * 31 + c.charCodeAt(0) | 0, 7)).toString(36)
+        k = prefix
+        for (let index = 2; base[k]; index++) k = prefix + '-' + index
+      }
+      const r = await api('/api/own', { own: { ...base, [k]: np } })
+      if (!r.ok) {
+        const fields = { name:'on',type:'ot',s:'os',p:'op',u:'ou',security:'osecurity',pk:'opk',sid:'osid',flow:'oflow',cipher:'ocipher',alpn:'oalpn',fp:'ofp',headers:'oheaders',plugin:'oplugin',pluginOpts:'oplugin',obfs:'oobfs',opwd:'oopwd',ports:'oports',encryption:'oencryption',net:'onet',path:'opath',hopInterval:'ohop',upMbps:'oup',downMbps:'odown',idleCheck:'oidlecheck',idleTimeout:'oidletimeout',minIdle:'ominidle',importExtras:'oimportextras',verifyName:'overifyname',certSha256:'ocertsha256' }
+        b.querySelector('#ownadvanced').open = true
+        return { msg: r.msg || '保存失败', field: fields[r.field] || 'on' }
+      }
+      OWN = null
+      return null
+    } })
+    if (!box) return
+    POL = null; PRF = null; CH = null
+    toast(isNew ? '已添加' : '已保存'); dash(true)
+  }
 }
 
 // ---------- 管理端页面 ----------
@@ -4360,6 +4900,20 @@ input.bad:focus,textarea.bad:focus{border-color:var(--warn);box-shadow:0 0 0 3.5
 .md .ft{display:flex;gap:8px;justify-content:flex-end;align-items:center;padding:14px 23px 20px;flex-shrink:0;border-top:1px solid transparent;transition:border-color .18s var(--e)}
 .md .ft .left{margin-right:auto;display:flex;gap:6px}
 .fg{margin-bottom:14px}.fg:last-child{margin-bottom:0}
+.own-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:end;gap:12px;margin-bottom:14px}
+.own-fields.own-address{grid-template-columns:minmax(0,1fr) 112px}
+.own-fields > .fg{min-width:0;margin:0}
+.own-fields input{min-width:0;height:40px}
+.own-check{position:relative;display:flex;align-items:center;gap:9px;min-height:36px;margin:0 0 10px;color:var(--tx2);font-size:12.5px;font-weight:500;line-height:1.6;cursor:pointer}
+.own-check input{position:absolute;width:18px;height:18px;margin:0;padding:0;opacity:0;cursor:pointer}
+.own-check-box{display:inline-flex;align-items:center;justify-content:center;flex:0 0 18px;width:18px;height:18px;border:1.5px solid var(--bd);border-radius:5px;background:var(--card);transition:background .14s var(--e),border-color .14s var(--e),box-shadow .14s var(--e)}
+.own-check-box::after{content:'';width:5px;height:9px;border:2px solid var(--onAcc);border-top:0;border-left:0;transform:translateY(-1px) rotate(45deg);opacity:0;transition:opacity .14s var(--e)}
+.own-check:hover .own-check-box{border-color:var(--tx4)}
+.own-check input:checked + .own-check-box{background:var(--acc);border-color:var(--acc)}
+.own-check input:checked + .own-check-box::after{opacity:1}
+.own-check input:focus-visible + .own-check-box{outline:2px solid var(--acc);outline-offset:3px}
+.own-check input:disabled ~ span{opacity:.5;cursor:not-allowed}
+@media (max-width:480px){.own-fields,.own-fields.own-address{grid-template-columns:minmax(0,1fr);gap:14px}}
 .fsep{border:0;border-top:1px solid var(--bd2);margin:4px 0 18px}
 
 /* 顶部居中 toast，位移动画放在 .toast 自身避免两层 transform 打架 */
@@ -5356,7 +5910,7 @@ function viewNode(){
   return h + '<div class="foot anim" style="animation-delay:.14s">节点每小时自动刷新，上游故障时沿用缓存</div>'
 }
 
-const protoName = n => n.type === 'vless' ? (n.net === 'ws' ? 'VLESS WS' : n.net === 'xhttp' ? 'VLESS XHTTP' : 'VLESS Reality') : 'Hysteria2'
+const protoName = n => n.type === 'vless' ? ('VLESS ' + (n.security === 'reality' || (n.security === undefined && n.net !== 'ws') ? 'Reality' : (n.net || 'tcp').toUpperCase())) : ({hysteria2:'Hysteria2',ss:'Shadowsocks',vmess:'VMess',anytls:'AnyTLS'}[n.type] || n.type)
 function ownCardInner(){
   const ow = (OWN && OWN.own) || {}
   let h = \`<div class="ttl">自有节点<span class="sub">自建服务器</span><span class="sp">
@@ -5367,13 +5921,16 @@ function ownCardInner(){
   h += Object.entries(ow).map(([k,n]) => \`<div class="up own">
       <span class="dot"></span>
       <span class="nm">\${esc(n.name)}</span>
-      <span class="tgt">\${protoName(n)}</span>
+      <span class="tgt">\${esc(protoName(n))}</span>
       <span class="u">\${esc(n.s)}:\${esc(String(n.p))}\${n.ports ? ' · 跳跃 ' + esc(n.ports) : ''}</span>
       <button class="ib" data-tip="复制分享链接" aria-label="复制分享链接" onclick="copyOwnLink(\${jsq(k)},this)">\${icon('link')}</button>
       <button class="ib" data-tip="编辑" aria-label="编辑" onclick="editOwn(\${jsq(k)})">\${icon('edit')}</button>
       <button class="ib dl" data-tip="删除" aria-label="删除" onclick="delOwn(\${jsq(k)})">\${icon('trash')}</button>
-    </div>\`).join('') || blankHTML('server', '还没有自有节点', '有自建的 VLESS Reality / Hysteria2 节点就加进来，没有可以跳过。')
-  return h + '</div>'
+    </div>\`).join('') || blankHTML('server', '还没有自有节点', '支持 VLESS、Hysteria2、Shadowsocks、VMess、AnyTLS，按协议编辑连接参数。')
+  h += '</div>'
+  const warnings = Object.entries((OWN && OWN.compatibility) || {}).flatMap(([k, items]) => items.map(w => ({...w, name: (ow[k] || {}).name || k})))
+  if (warnings.length) h += '<details class="fg"><summary class="lb" style="cursor:pointer">客户端兼容提示（' + warnings.length + '）</summary><div class="hint">' + warnings.map(w => esc(w.name + ' · ' + ((CLIENTS.find(c => c.k === w.format) || {}).label || w.format) + '：' + w.reason)).join('<br>') + '</div></details>'
+  return h
 }
 
 // 链式代理：先连中转、再从中转连落地，出口 IP 是落地的。
@@ -6012,9 +6569,9 @@ window.previewSub = i => {
     }
     const cut = show.length > 400000
     const u = r.usage ? Object.fromEntries(r.usage.split(';').map(s => s.trim().split('='))) : null
-    return (cache[f] = { ok: true, f, body: r.body, name: r.filename, top: 0, left: 0,
+    return (cache[f] = { ok: true, f, body: r.body, name: r.filename, top: 0, left: 0, warnings: r.warnings || [],
       html: hlCode(cut ? show.slice(0, 400000) + '\\n…（太长，只显示前 400KB，完整内容请下载）' : show, r.fmt),
-      stats: [\`\${r.nodes} 个节点\`, r.fmt === 'share' ? '' : \`\${r.policies} 条策略\`, \`\${show.split('\\n').length} 行\`, fmtBytes(r.bytes),
+      stats: [\`\${r.nodes} 个候选节点\`, r.fmt === 'share' ? '' : \`\${r.policies} 条策略\`, \`\${show.split('\\n').length} 行\`, fmtBytes(r.bytes),
         u && +u.total ? \`流量 \${fmtSize(+u.total - (+u.upload||0) - (+u.download||0))} / \${fmtSize(+u.total)}\` : '', note]
         .filter(Boolean).map(s => \`<span>\${esc(s)}</span>\`).join('') })
   }))
@@ -6035,12 +6592,16 @@ window.previewSub = i => {
     pre.dataset.f = fmt
     pre.scrollTop = v.top; pre.scrollLeft = v.left
     st.innerHTML = v.stats
+    const warnings = b.querySelector('#pvwarnings')
+    warnings.hidden = !v.warnings.length
+    warnings.textContent = v.warnings.map(w => w.name + '：' + w.reason).join('；')
   }
   const cur = () => cache[fmt]
   modal({ title: '预览 · ' + x.name, xl: true, ok: '关闭', noCancel: true,
     desc: '客户端拉到的就是这份内容。里面是真实的节点密钥，截图外发前记得打码。',
     html: \`<div class="seg" id="pvf" style="align-self:flex-start">\${CLIENTS.map(z => \`<button type="button" data-f="\${z.k}" class="\${z.k===fmt?'on':''}">\${z.label}</button>\`).join('')}</div>
       <div class="stats pv" id="pvs"></div>
+        <div class="hint" id="pvwarnings" role="status" hidden></div>
       <div class="pvw" id="pvw"><pre class="code pv" id="pvc" tabindex="0">\${[62, 38, 51, 44, 70, 33, 57].map(w => \`<span class="sk" style="display:block;width:\${w}%;height:11px;margin:5px 0 12px"></span>\`).join('')}</pre>
         <span class="pvl">加载中…</span></div>\`,
     foot: \`<button class="g sm" id="pvcopy">\${icon('copy','s')}复制</button><button class="g sm" id="pvdl">\${icon('dl','s')}下载</button>\`,
@@ -6484,149 +7045,7 @@ window.editSettings = async () => {
   toast('已保存'); dash(true)
 }
 
-/* 自有节点编辑：按协议动态切换专属字段 */
-window.editOwn = async (key) => {
-  const isNew = key === null
-  const ow = (OWN && OWN.own) || {}
-  const n = isNew ? { name:'', type:'vless', s:'', p:443, u:'', sni:'', net:'tcp', flow:'xtls-rprx-vision', pk:'', sid:'', path:'/', host:'', obfs:'salamander', opwd:'', ports:'' } : JSON.parse(JSON.stringify(ow[key]))
-  const html = \`
-    \${isNew ? \`<div class="fg"><label class="lb" for="oimp">从分享链接导入<span class="opt">可选</span></label>
-      <div class="row"><input id="oimp" class="mono" placeholder="vless://… 或 hysteria2://…" spellcheck="false" autocomplete="off">
-        <button type="button" class="g" id="oimpb" style="white-space:nowrap">解析填充</button></div>
-      <div class="hint">粘贴节点的分享链接，自动填好下面各项，核对无误就能直接保存。</div></div><hr class="fsep">\` : ''}
-    <div class="fg"><label class="lb" for="on">节点名称</label><input id="on" value="\${esc(n.name)}" placeholder="如 美西-AI-Vision" maxlength="32">
-      <div class="hint">会作为节点名出现在客户端里，也是分流策略里选择它时看到的名字。</div></div>
-    <div class="fg"><label class="lb">协议</label>
-      \${selectHTML('ot', [{v:'vless',label:'VLESS'},{v:'hysteria2',label:'Hysteria2'}], n.type)}</div>
-    <div class="fg"><label class="lb" for="os">服务器 / 端口</label>
-      <div class="row"><input id="os" class="mono" value="\${esc(n.s)}" placeholder="cloud.example.com" spellcheck="false">
-        <input id="op" class="mono" value="\${esc(String(n.p||443))}" placeholder="443" inputmode="numeric" style="max-width:110px"></div></div>
-    <div class="fg"><label class="lb" id="ulb" for="ou">UUID</label><input id="ou" class="mono" value="\${esc(n.u)}" placeholder="uuid 或密码" spellcheck="false" autocomplete="off"></div>
-    <div class="fg"><label class="lb" for="osni">SNI</label><input id="osni" class="mono" value="\${esc(n.sni||'')}" placeholder="www.bing.com" spellcheck="false"></div>
-    <div id="fv">
-      <div class="fg"><label class="lb">传输方式</label>
-        \${selectHTML('onet', [{v:'tcp',label:'TCP + Reality（Vision 流控）'},{v:'xhttp',label:'XHTTP + Reality'},{v:'ws',label:'WebSocket + TLS（可套 CDN）'}], n.net||'tcp')}</div>
-      <div class="fg" id="fr"><label class="lb" for="opk">Reality 公钥 / ShortId</label>
-        <div class="row"><input id="opk" class="mono" value="\${esc(n.pk||'')}" placeholder="PublicKey" spellcheck="false">
-          <input id="osid" class="mono" value="\${esc(n.sid||'')}" placeholder="ShortId" style="max-width:150px" spellcheck="false"></div></div>
-      <div class="fg" id="fw" hidden><label class="lb" for="opath">WebSocket 路径 / Host<span class="opt">Host 留空则用 SNI</span></label>
-        <div class="row"><input id="opath" class="mono" value="\${esc(n.path||'/')}" placeholder="/" style="max-width:180px" spellcheck="false">
-          <input id="ohost" class="mono" value="\${esc(n.host||'')}" placeholder="cdn.example.com" spellcheck="false"></div></div>
-    </div>
-    <div id="fh" hidden>
-      <div class="fg"><label class="lb" for="oports">端口跳跃<span class="opt">可留空</span></label><input id="oports" class="mono" value="\${esc(n.ports||'')}" placeholder="50000-50020"></div>
-      <div class="fg"><label class="lb" for="oobfs">混淆类型 / 密码</label>
-        <div class="row"><input id="oobfs" class="mono" value="\${esc(n.obfs||'salamander')}" placeholder="salamander" style="max-width:150px">
-          <input id="oopwd" class="mono" value="\${esc(n.opwd||'')}" placeholder="obfs 密码" autocomplete="off"></div></div>
-    </div>
-    \${isNew ? '' : \`<div class="fg"><label class="lb">节点标识<span class="opt">自动生成，不可改</span></label>
-      <input class="mono" value="\${esc(key || '')}" disabled>
-      <div class="hint">分流策略在内部通过它指向这个节点，所以建好之后不能再变。</div></div>\`}\`
-
-  const box = await modal({ title: isNew ? '添加自有节点' : '编辑自有节点', html, ok:'保存', wide:true, onMount: b => {
-    bindSelect(b)
-    const sync = () => {
-      const t = b.querySelector('#ot').dataset.v
-      const ws = b.querySelector('#onet').dataset.v === 'ws'
-      b.querySelector('#fv').hidden = t !== 'vless'
-      b.querySelector('#fh').hidden = t !== 'hysteria2'
-      b.querySelector('#fr').hidden = ws
-      b.querySelector('#fw').hidden = !ws
-      b.querySelector('#ulb').textContent = t === 'vless' ? 'UUID' : '密码'
-    }
-    b.querySelectorAll('#ot .selo, #onet .selo').forEach(o => o.addEventListener('click', () => setTimeout(sync, 0)))
-    sync()
-
-    const impb = b.querySelector('#oimpb')
-    if (impb) impb.addEventListener('click', async () => {
-      b.querySelectorAll('.ferr').forEach(e => e.remove())
-      b.querySelectorAll('.bad').forEach(e => e.classList.remove('bad'))
-      const box2 = b.querySelector('#oimp')
-      const link = box2.value.trim()
-      const say = (m, warn) => {
-        const tip = document.createElement('div')
-        tip.className = 'ferr'
-        if (!warn) box2.classList.add('bad')
-        else tip.style.color = 'var(--tx2)'
-        tip.textContent = m
-        box2.closest('.fg').appendChild(tip)
-      }
-      if (!link) return say('先粘贴一条分享链接')
-      impb.disabled = true; impb.textContent = '解析中…'
-      const r = await api('/api/parse-share', { link })
-      impb.disabled = false; impb.textContent = '解析填充'
-      if (!r.ok) return say(r.msg || '解析失败')
-      const n2 = r.node
-      // 协议是自定义下拉，点一下对应项才会重绘显示
-      const opt = b.querySelector('#ot .selo[data-v="' + n2.type + '"]')
-      if (opt && b.querySelector('#ot').dataset.v !== n2.type) opt.click()
-      setTimeout(() => {
-        const put = (id, v) => { const el = b.querySelector('#' + id); if (el && v !== undefined && v !== null) el.value = v }
-        put('on', n2.name); put('os', n2.s); put('op', n2.p); put('ou', n2.u); put('osni', n2.sni)
-        if (n2.type === 'vless') {
-          put('opk', n2.pk); put('osid', n2.sid); put('opath', n2.path); put('ohost', n2.host)
-          const no = b.querySelector('#onet .selo[data-v="' + (n2.net || 'tcp') + '"]')
-          if (no && b.querySelector('#onet').dataset.v !== (n2.net || 'tcp')) no.click()
-        } else {
-          put('oports', n2.ports); put('oobfs', n2.obfs || 'salamander'); put('oopwd', n2.opwd)
-        }
-        sync()
-        say(n2.warn || '已填好，核对一下就能保存', !n2.warn)
-        const nf = b.querySelector('#on')
-        if (nf) nf.focus()
-      }, 30)
-    })
-  }, onSubmit: async b => {
-    const val = id => b.querySelector('#' + id).value.trim()
-    const t = selValue(b.querySelector('#ot'))
-    if (!val('on')) return { msg:'请填写节点名称', field:'on' }
-    // 标识是内部引用（策略里的 own:xxx），用户在策略下拉里看到的一直是节点名，
-    // 从头到尾接触不到它 —— 以前却要人手填，还得遵守「只能字母数字连字符」。
-    // 新建时按名称生成，重了就加序号。已有节点的标识保持不变，否则策略会失效。
-    let k = key
-    if (!k) {
-      const base = 'n' + Math.abs([...val('on')].reduce((x, c) => x * 31 + c.charCodeAt(0) | 0, 7)).toString(36)
-      k = base
-      for (let n2 = 2; ow[k]; n2++) k = base + '-' + n2
-    }
-    if (!val('os')) return { msg:'请填写服务器地址', field:'os' }
-    if (!/^\\d+$/.test(val('op')) || +val('op') < 1 || +val('op') > 65535) return { msg:'端口要是 1-65535 的数字', field:'op' }
-    if (!val('ou')) return { msg: t === 'vless' ? '请填写 UUID' : '请填写密码', field:'ou' }
-
-    const np = { name: val('on'), type: t, s: val('os'), p: val('op'), u: val('ou'), sni: val('osni') }
-    if (t === 'vless' && selValue(b.querySelector('#onet')) === 'ws') {
-      np.net = 'ws'; np.flow = ''
-      np.path = val('opath') || '/'
-      if (!np.path.startsWith('/')) return { msg:'路径要以 / 开头', field:'opath' }
-      if (val('ohost')) np.host = val('ohost')
-    } else if (t === 'vless') {
-      // Reality 缺公钥会让客户端握手失败，报错极难定位，挡在这里
-      if (!val('opk')) return { msg:'VLESS Reality 必须填公钥', field:'opk' }
-      if (!val('osid')) return { msg:'VLESS Reality 必须填 ShortId', field:'osid' }
-      // 格式不对的公钥会让客户端拒绝加载整份订阅，不只是这一个节点连不上
-      if (!/^[A-Za-z0-9_-]{43}$/.test(val('opk'))) return { msg:'公钥应是 43 位的 base64url（xray x25519 输出的 Public key），现在是 ' + val('opk').length + ' 位', field:'opk' }
-      if (!/^([0-9a-fA-F]{2}){0,8}$/.test(val('osid'))) return { msg:'ShortId 应是十六进制、位数为偶数、最多 16 位', field:'osid' }
-      np.pk = val('opk'); np.sid = val('osid')
-      np.net = selValue(b.querySelector('#onet'))
-      np.flow = np.net === 'tcp' ? 'xtls-rprx-vision' : ''
-    } else {
-      np.ports = val('oports'); np.obfs = val('oobfs'); np.opwd = val('oopwd')
-    }
-    // 保存前重新拉一次自有节点，避免页面 OWN 过期/未加载时
-    // 用空对象合并，把其它节点「覆盖删掉」触发误报悬空引用。
-    const fresh = await api('/api/own')
-    if (!fresh || !fresh.ok) return (fresh && fresh.msg) || '读取自有节点失败，请刷新后再试'
-    const base = (fresh.own && typeof fresh.own === 'object') ? fresh.own : {}
-    const r = await api('/api/own', { own: { ...base, [k]: np } })
-    if (!r.ok) return r.msg || '保存失败'      // 服务端的话也留在弹窗里，不关
-    OWN = null
-    return null
-  }})
-  if (!box) return
-  POL = null; PRF = null; CH = null
-  toast(isNew ? '已添加' : '已保存')
-  dash(true)
-}
+${"(" + installOwnEditor.toString().replace(/\n  /g, '\n') + ")()"}
 
 window.delOwn = async (key) => {
   const n = ((OWN && OWN.own) || {})[key] || { name: key }
@@ -7010,15 +7429,14 @@ window.probeUp = async (id) => {
       h += row('采用', \`\${uaName(r)} 这一份\`)
       h += row('HTTP', r.http) + row('响应格式', r.fmt) + row('大小', r.bytes + ' 字节') + row('解析到节点', r.nodes + ' 个')
       h += row('用量响应头', r.hasUserinfo ? r.headers['subscription-userinfo'] : '机场没有返回 Subscription-Userinfo 头')
-      h += row('识别到的公告行', r.notes.length ? r.notes.join('\\n') : '（无）')
+      h += row('公告行数量', r.noteCount || 0)
       h += row('最终用量信息', r.meta
         ? \`总量 \${r.meta.total ? fmtSize(r.meta.total) : '未知'} · 已用 \${fmtSize((r.meta.up||0)+(r.meta.down||0))} · 到期 \${r.meta.expire ? new Date(r.meta.expire*1000).toLocaleDateString('zh-CN') : '未知'}\`
         : '解析不出 —— 上面两行都没有可用信息')
-      h += row('响应前几行', r.sample.join('\\n'))
     }
     return h + '</div>'
   }
-  await modal({ title:'抓取诊断' + (u.name ? ' · ' + u.name : ''), desc:'机场到底给了什么，我们又解析出了什么。密钥字段已抹去。', ok:'知道了', noCancel:true, wide:true,
+  await modal({ title:'抓取诊断' + (u.name ? ' · ' + u.name : ''), desc:'仅显示状态、数量和用量等诊断信息，不显示订阅原文。订阅地址、二维码和备份仍需保密。', ok:'知道了', noCancel:true, wide:true,
     html: '<div id="pbx"><div class="skrow"><div class="sk" style="width:120px;height:13px"></div><div class="sk" style="width:48%;height:12px"></div></div><div class="hint">正在用几种客户端身份逐个试拉，可能要十几秒…</div></div>',
     onMount: async b => {
       const r = await api('/api/probe', { id })

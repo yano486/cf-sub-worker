@@ -16,6 +16,8 @@ jobs:
         run: npm install --prefix test --no-audit --no-fund
       - name: 单元与接口测试
         run: node test/run.cjs
+      - name: 协议与安全回归
+        run: node --test test/own-protocols.cjs test/import-compatibility.cjs test/encryption-path.cjs test/security-hardening.cjs
       # ubuntu-latest 自带 Google Chrome
       - name: 端到端测试
         run: node test/e2e.mjs

@@ -1808,7 +1808,7 @@ sec('44. 自有节点：表单校验不再清空重填')
   // 逐项校验都带 field，能定位到具体输入框
   ok(/field:'on'/.test(ui) && /field:'os'/.test(ui) &&
      /field:'op'/.test(ui) && /field:'ou'/.test(ui), '名称/服务器/端口/密钥都能定位')
-  ok(/field:'opk'/.test(ui) && /field:'osid'/.test(ui), 'Reality 公钥与 ShortId 也能定位')
+  ok(/pk:'opk'/.test(ui) && /sid:'osid'/.test(ui), 'Reality 服务端校验字段映射到公钥与 ShortId 输入框')
   // 标识改成自动生成后，这几条手填相关的校验连同输入框一起没了
   ok(!/field:'ok'/.test(ui), '不再有标识字段的校验')
   ok(/端口要是 1-65535 的数字/.test(ui), '端口有范围校验')
@@ -1826,10 +1826,10 @@ sec('45. 自有节点：分享链接快捷添加')
   ok(hy && hy.node.ports === '50000-50020', '端口跳跃取自 mport')
   ok(hy && hy.node.sni === 'hk.example.com', 'sni')
 
-  const vl = S('vless://11111111-2222-3333-4444-555555555555@hk.example.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.bing.com&fp=chrome&pbk=PUBKEY123&sid=a59fd0ae2f7d509b&type=tcp#hk2-reality')
+  const vl = S('vless://11111111-2222-3333-4444-555555555555@hk.example.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.bing.com&fp=chrome&pbk=' + 'A'.repeat(43) + '&sid=a59fd0ae2f7d509b&type=tcp#hk2-reality')
   ok(vl && vl.node.type === 'vless', 'vless 链接可解析')
   ok(vl && vl.node.u === '11111111-2222-3333-4444-555555555555', 'UUID')
-  ok(vl && vl.node.pk === 'PUBKEY123' && vl.node.sid === 'a59fd0ae2f7d509b', 'Reality 公钥与 ShortId')
+  ok(vl && vl.node.pk === 'A'.repeat(43) && vl.node.sid === 'a59fd0ae2f7d509b', 'Reality 公钥与 ShortId')
   ok(vl && vl.node.sni === 'www.bing.com', 'SNI 伪装域名')
   ok(vl && vl.node.net === 'tcp' && vl.node.flow === 'xtls-rprx-vision', 'TCP + Vision 流控')
   ok(vl && vl.node.name === 'hk2-reality', '节点名取自链接末尾的锚点')
@@ -1839,9 +1839,9 @@ sec('45. 自有节点：分享链接快捷添加')
   const noPk = S('vless://11111111-2222-3333-4444-555555555555@a.example.com:443?security=reality&type=tcp#x')
   ok(noPk && /没有 Reality 公钥/.test(noPk.node.warn || ''), '缺公钥时给出提示')
 
-  // 自有节点只支持这两种协议，其它要说明白而不是静默失败
+  // 自有节点已扩展到五种协议，其它仍要说明白而不是静默失败
   const tj = S('trojan://pwd@a.example.com:443#T')
-  ok(tj && /只支持 VLESS Reality 与 Hysteria2/.test(tj.err || ''), '不支持的协议给出明确说明')
+  ok(tj && /VLESS.*HY2.*SS.*VMess.*AnyTLS/.test(tj.err || ''), '不支持的协议给出当前支持列表')
   ok(S('随便一段文字') === null && S('') === null, '非链接返回 null')
 
   const ui = T.adminHTML(true, true)
@@ -1924,7 +1924,7 @@ sec('47. 前端正则不能被模板字符串吃掉反斜杠')
   }
 
 
-  const portRe = grab(/if \(!(\/\^[^)]+?\/)\.test\(val\('op'\)\)/, '端口校验')
+  const portRe = grab(/if \(!(\/\^[^)]+?\/)\.test\((?:val\('op'\)|np\.p)\)/, '端口校验')
   if (portRe) {
     ok(portRe.test('443') && portRe.test('8443'), '数字端口通过')
     ok(!portRe.test('abc') && !portRe.test('44a') && !portRe.test(''), '非数字被拒')
@@ -1960,7 +1960,7 @@ sec('48. 节点标识自动生成，不再暴露给用户')
   ok(!/id="ok"/.test(ui), '新建表单里没有标识输入框')
   ok(/自动生成，不可改/.test(ui), '编辑时以只读形式展示，便于排查')
   ok(/let k = key\s*\n\s*if \(!k\) \{/.test(ui), '新建才生成，已有节点沿用原标识')
-  ok(/for \(let n2 = 2; ow\[k\]; n2\+\+\)/.test(ui), '重名时加序号，不覆盖已有节点')
+  ok(/for \(let index = 2; base\[k\]; index\+\+\)/.test(ui), '重名时按最新节点清单加序号，不覆盖已有节点')
   ok(!/补个标识/.test(ui), '文案里不再提「补个标识」')
 
   // 把生成逻辑抠出来实际跑一遍，确认产出合法且稳定
@@ -2111,7 +2111,7 @@ sec('51. 表单读取的元素必须在模板里存在')
   for (const { name, body } of uiBlocks()) {
     const defined = new Set(dynamic)
     for (const x of body.matchAll(/id="([\w-]+)"/g)) defined.add(x[1])
-    for (const x of body.matchAll(/(?:selectHTML|chipsHTML|ta)\('([\w-]+)'/g)) defined.add(x[1])
+    for (const x of body.matchAll(/(?:selectHTML|chipsHTML|ta|input|select|toggle)\('([\w-]+)'/g)) defined.add(x[1])
     const used = new Set()
     for (const x of body.matchAll(/querySelector(?:All)?\('#([\w-]+)/g)) used.add(x[1])
     for (const x of body.matchAll(/\b(?:val|put)\('([\w-]+)'/g)) used.add(x[1])
@@ -2586,7 +2586,7 @@ sec('82. 第二轮审查的回归')
   const rt = T.shareToOwn('vless://11111111-2222-3333-4444-555555555555@r.example.com:443?security=reality&pbk=' + 'A'.repeat(43) + '&sid=ab&type=tcp&flow=xtls-rprx-vision#R')
   ok(rt && rt.node.net === 'tcp' && rt.node.flow === 'xtls-rprx-vision' && rt.node.pk.length === 43, 'Reality 链接照旧导入为 tcp + Vision')
   const ui = T.adminHTML(true, true)
-  ok(/\{v:'ws',label:'WebSocket \+ TLS（可套 CDN）'\}/.test(ui) && /id="opath"/.test(ui) && /id="ohost"/.test(ui), '自有节点表单可选 WebSocket，并有路径与 Host 输入框')
+  ok(/\{v:'ws',label:'WebSocket \+ TLS（可套 CDN）'\}/.test(ui) && /input\('opath'/.test(ui) && /input\('ohost'/.test(ui), '自有节点表单可选 WebSocket，并生成路径与 Host 输入框')
 }
 
 sec('55. 粘贴导入的订阅源可以只改名字')

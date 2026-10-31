@@ -68,10 +68,30 @@ KV_NAMESPACE_ID=... bash deploy.sh    # 明确指定 KV namespace
 之后管理端的「节点」页会给出上手清单，依次完成：
 
 1. **设置 → 站点** — 填本站域名（用于 DNS 策略与自身直连规则）
-2. **节点** — 添加机场订阅源；有自建节点就一并添加（支持 VLESS Reality、VLESS WebSocket+TLS 与 Hysteria2，可粘贴分享链接自动填表）
+2. **节点** — 添加机场订阅源；有自建节点就一并添加（支持 VLESS、Hysteria2、Shadowsocks、VMess 与 AnyTLS，可粘贴分享链接自动填表）
 3. **订阅** — 默认已有一份，选好客户端后复制地址、扫码或一键导入；给不同设备可再建几份
 
 ## 客户端
+
+### 自有节点编辑
+
+添加或编辑自有节点时，基础字段按协议切换，高级字段收在「高级配置」中：
+
+成对字段使用对齐的网格布局，窄屏自动改为上下排列；勾选项统一使用站点主题色，保留键盘空格操作、焦点反馈和文字点击切换。
+
+- **VLESS**：TLS / Reality、Flow、Encryption、TCP / WS / HTTPUpgrade / gRPC / H2 / XHTTP、路径、Host、ServiceName、指纹、ALPN 与 UDP 包编码。
+- **Hysteria2**：完整认证密码（可含 `username:password`）、SNI、ALPN、证书校验、Salamander、端口跳跃、跳跃间隔和带宽。QUIC 不使用 TCP uTLS 指纹；实验性 Gecko / Realm 未混入当前兼容模式。
+- **Shadowsocks**：加密方式（含 SS2022）、密码 / 密钥、UDP-over-TCP、simple-obfs / v2ray-plugin 的可视化参数。SS2022 密钥会检查 Base64 和长度。
+- **VMess**：UUID、加密方式、AlterID、TLS、传输、WS 请求头与 Early Data。
+- **AnyTLS**：密码、TLS、SNI、ALPN、指纹和空闲会话池参数。
+
+字段在保存、重新打开和支持该字段的订阅格式中保持一致。VMess 按 [v2rayN 官方分享格式](https://github.com/2dust/v2rayN/wiki/Description-of-VMess-share-link)识别 `insecure`、`vcn`、`pcs`；AnyTLS 省略端口时使用官方默认的 443。未知附加字段不再阻断整条链接，会保留在「导入扩展字段」中、随保存和再次编辑保留，并在完整配置兼容提示中列出。原始分享链接导出保留这些扩展参数；尚未实现的连接参数不代表已生效，请按提示选择适合的客户端。无效必填字段、非法安全模式和不完整认证仍会明确报错，不会靠默认选项悄悄改写。旧 VLESS / Hysteria2 记录不在读取或保存其他节点时迁移；原有节点标识和订阅 token 不变。
+
+证书校验域名 `vcn` 和完整证书 SHA256 指纹 `pcs` / `pinSHA256` 可在高级配置中编辑，并映射到 Clash 的 `name-cert-verify` / `fingerprint`。完整证书指纹不能当成公钥指纹；兼容的 sing-box 1.12–1.14 无法表达时会提示并剔除该节点，而不是去掉证书校验强行连接。
+
+不同客户端不是同一套协议能力：XHTTP、VLESS Encryption、SS 插件及某些高级调优项不能用所有格式表达。「自有节点」下方及订阅预览会列出具体兼容提示，不能忠实转换的节点会从该格式和分组引用中一起剔除。通用 URI 不携带 UDP 开关、任意请求头或 AnyTLS 会话池等客户端专属设置；需要这些参数时使用 Clash / sing-box 完整配置。
+
+字段依据：[Project X](https://xtls.github.io/config/outbounds/vless.html)、[Hysteria](https://v2.hysteria.network/docs/advanced/Full-Client-Config/)、[Shadowsocks SIP002](https://shadowsocks.org/doc/sip002.html)、[AnyTLS](https://github.com/anytls/anytls-go/blob/main/docs/protocol.md)、[Mihomo](https://wiki.metacubex.one/config/proxies/) 与 [sing-box](https://sing-box.sagernet.org/configuration/outbound/)。
 
 在「订阅」页顶部选客户端，下面每份订阅的地址、二维码、一键导入都会跟着切换。
 
@@ -119,6 +139,9 @@ KV_NAMESPACE_ID=... bash deploy.sh    # 明确指定 KV namespace
 - **管理密码** PBKDF2 加盐存储（老版本的无盐哈希在下次登录时自动升级）；同一 IP（IPv6 按 /64）连续输错 5 次锁定 15 分钟，改密码时猜旧密码同样计数。计数放在内存与 Cache API 里、不写 KV —— 否则谁都能不登录就刷光每天的 KV 写入额度
 - **会话** cookie 为 `HttpOnly` / `Secure` / `SameSite=Lax`，写接口另外核对来源并只收 JSON，跨站伪造不了；改密码或「让其它设备下线」会让其它会话全部失效
 - **管理端页面**带 CSP、禁止被嵌套、不发 Referer；机场送来的节点名、机场名在管理端一律转义 —— 它们是第三方可控的输入
+- **HTTPS**：非本机 HTTP 页面请求跳转 HTTPS，HTTP 写操作直接拒绝；HTTPS 响应带 HSTS。节点与订阅地址应始终使用 HTTPS，跳转无法追回已经发到 HTTP 链路的内容。
+- **存储故障**：密码、会话密钥和订阅权限读取失败时返回暂时不可用，不重新初始化、不恢复默认授权、不覆盖已有密钥。
+- **抓取诊断**只显示状态、格式、数量和解析后的用量信息，不回显订阅原文、原始公告、远端错误正文或任意响应头；二维码、订阅地址与备份仍需保密。
 - **订阅 token** 至少 16 位，定长比较；订阅页记录每份订阅最近被哪些客户端拉过（IP、客户端、时间），出现不认识的就重新生成 token
 - **备份文件**包含全部配置和节点凭据（不含登录密码），请妥善保管
 
@@ -147,7 +170,10 @@ KV_NAMESPACE_ID=... bash deploy.sh    # 明确指定 KV namespace
 
 ```bash
 node dev/server.mjs                     # 本地预览 http://localhost:8787/admin，密码 devpassword
-cd test && npm install && node run.cjs  # 单元与接口测试
+npm install --prefix test && node test/run.cjs  # 单元与接口测试
+node --test test/own-protocols.cjs       # 自有节点多协议保存、导入、输出与兼容回归
+node --test test/import-compatibility.cjs # 官方分享链接字段与扩展参数导入回归
+node --test test/security-hardening.cjs   # HTTPS、权威状态故障关闭与诊断最小输出回归
 node test/e2e.mjs                       # 端到端：在无头 Chrome 里把管理端完整点一遍（需本机有 Chrome）
 node scripts/build-demo.mjs             # 重新生成 docs/demo.html
 node scripts/shots.mjs                  # 重新生成 README 截图
