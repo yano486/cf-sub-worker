@@ -92,6 +92,18 @@ const UP_BUDGET = 20000
 const FRESH_TTL = 3600      // 1h 内直接用缓存
 const STALE_TTL = 604800    // 缓存保留 7d，上游挂了拿它兜底
 
+function upstreamUpdateMode(u) {
+  return u.updateMode || (u.auto === false ? 'manual' : 'auto')
+}
+
+function validLocalFeedUrl(value, panelUrl) {
+  try {
+    const target = new URL(value), panel = new URL(panelUrl)
+    const local = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(panel.hostname) && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(target.hostname)
+    return !target.username && !target.password && target.origin !== panel.origin && (target.protocol === 'https:' || (local && target.protocol === 'http:'))
+  } catch (e) { return false }
+}
+
 // 地区分类：顺序敏感，先匹配先归类
 const REGIONS = [
   { key: 'jp', flag: '🇯🇵', cn: '日本', re: /Japan|名古屋|日本|\bJP\b|东京|東京|大阪|埼玉|川日|穗日|沪日|滬日/i },
@@ -2080,6 +2092,7 @@ function parsePasted(text, u) {
 // 逐个 UA 试，取第一个「能访问且真的解析出节点」的结果 —— 只看 2xx 不够，
 // 机场对不同 UA 回的格式不同，有的那一份里根本没有节点。
 async function fetchUpstream(u) {
+  if (upstreamUpdateMode(u) === 'local') throw new Error('该订阅源仅允许浏览器本地拉取，不使用 Cloudflare 出口')
   // 粘贴导入的源没有可重拉的链接，平时靠快照供节点。快照万一没了也别去 fetch 空串。
   if (!/^https?:\/\//.test(u.url || '')) throw new Error('这个源没有订阅链接，只有粘贴导入的快照')
   const tries = []
@@ -2137,6 +2150,10 @@ async function loadNodes(force, event) {
     }
     // 一次性链接反复拉必然失败，平时根本不该去请求它
     // （还没有快照就仍拉一次，否则这个源永远是空的）
+    if (upstreamUpdateMode(u) === 'local') {
+      if (!await useSnap('')) got.errors.push({ id: u.id, up: u.name, msg: '本地模式尚无快照，请在管理页使用本地网络拉取' })
+      return got
+    }
     if (u.auto === false && await useSnap('')) return got
     try {
       const r = await fetchUpstream(u)
@@ -2458,6 +2475,17 @@ function crossSite(req, url) {
 }
 
 async function adminRoute(req, url) {
+  if (url.pathname === '/admin/local-fetch') {
+    if (!await checkCookie(req)) return json({ ok: false, msg: '未登录' }, 401)
+    if (req.method !== 'GET') return json({ ok: false, msg: '请求方式不正确' }, 405)
+    const origin = url.searchParams.get('origin') || ''
+    let target
+    try { target = new URL(origin) } catch (e) { return json({ ok: false, msg: '订阅站点格式不正确' }, 400) }
+    const local = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(url.hostname) && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(target.hostname)
+    if (target.origin !== origin || target.username || target.password || (target.protocol !== 'https:' && !(local && target.protocol === 'http:')) || target.origin === url.origin)
+      return json({ ok: false, msg: '本地拉取只允许有效的 HTTPS 订阅站点' }, 400)
+    return new Response(localFetchHTML(origin), { headers: { ...ADMIN_HEADERS, 'Content-Security-Policy': ADMIN_HEADERS['Content-Security-Policy'].replace("connect-src 'self';", "connect-src 'self' " + origin + ';') } })
+  }
   if (url.pathname === '/admin/login' && req.method === 'POST') {
     if (!hasKV) return json({ ok: false, msg: 'KV 未绑定' }, 500)
     if (crossSite(req, url)) return json({ ok: false, msg: '拒绝跨站请求' }, 403)
@@ -2554,6 +2582,8 @@ async function apiRoute(req, url, event) {
 
   if (p === '/api/upstreams' && req.method === 'POST') {
     const body = await req.json().catch(() => ({}))
+    if (body.updateMode !== undefined && !['auto','manual','local'].includes(body.updateMode)) return json({ ok: false, msg: '更新方式不正确' }, 400)
+    if (body.text && new TextEncoder().encode(String(body.text)).length > 2 * 1024 * 1024) return json({ ok: false, msg: '订阅内容不能超过 2MB' }, 400)
     const ups = await kvGet('upstreams', [])
     let added = null, addedN = 0
     if (body.act === 'add') {
@@ -2572,14 +2602,21 @@ async function apiRoute(req, url, event) {
         }
       }
       added = { id: randHex(6), name: nm || '未命名机场', url: String(body.url || ''), enabled: true }
+      if (body.updateMode !== undefined) { added.updateMode = body.updateMode; added.auto = body.updateMode === 'auto' }
+      if (body.updateMode === 'local' && (!pasted || !validLocalFeedUrl(added.url, req.url))) return json({ ok: false, msg: '本地模式需要 HTTPS 订阅链接及浏览器成功拉取的内容，不会回退到 Cloudflare 拉取' }, 400)
       if (pasted) {
         // 机场挡住 Worker（403/1020）时的退路：内容由浏览器取、人工贴进来。
         // 浏览器是从用户自己的网络访问机场的，不经过我们这边的出口。
         const r = parsePasted(pasted, added)
         if (r.err) return json({ ok: false, msg: r.err }, 400)
+        if (body.userinfo && typeof body.userinfo === 'string' && body.userinfo.length <= 1024) r.got.info = mergeMeta(parseUserinfo(body.userinfo), r.got.info)
         added.auto = false          // 内容是手工给的，没有能自动重拉的来源
+        if (added.updateMode && added.updateMode !== 'local') added.updateMode = 'manual'
         addedN = r.got.nodes.length
-        await saveSnap(added.id, r.got, event)
+        if (added.updateMode === 'local') {
+          try { await saveSnap(added.id, r.got, null) }
+          catch (e) { return json({ ok: false, msg: '本地快照保存失败，尚未添加订阅源，请稍后重试' }, 503) }
+        } else await saveSnap(added.id, r.got, event)
       } else if (!body.force) {
         // 先试拉一次再落库。死链接静默收下的话，用户以为加成功了，
         // 实际每次聚合都白等它超时，还得自己去猜哪一条坏了。
@@ -2619,17 +2656,32 @@ async function apiRoute(req, url, event) {
     } else if (body.act === 'edit') {
       const u = ups.find(x => x.id === body.id)
       if (!u) return json({ ok: false, msg: '订阅源不存在' }, 404)
+      if (body.localRefresh && (typeof body.expectedUrl !== 'string' || body.expectedMode !== 'local' || body.updateMode !== 'local')) return json({ ok: false, msg: '本地刷新缺少原始链接及更新方式，请刷新页面后重试' }, 400)
+      if (body.expectedUrl !== undefined || body.expectedMode !== undefined) {
+        if (typeof body.expectedUrl !== 'string' || typeof body.expectedMode !== 'string') return json({ ok: false, msg: '原始订阅源标识不完整' }, 400)
+        if (u.url !== body.expectedUrl || upstreamUpdateMode(u) !== body.expectedMode) return json({ ok: false, msg: '订阅链接或更新方式已在其他页面更改，本次下载未保存，请刷新页面后重试' }, 409)
+      }
+      const mode = body.updateMode || upstreamUpdateMode(u)
+      const changedUrl = body.url && body.url !== u.url
+      if (mode === 'local' && (!validLocalFeedUrl(String(body.url || u.url || ''), req.url) || ((!String(body.text || '').trim()) && (changedUrl || upstreamUpdateMode(u) !== 'local'))))
+        return json({ ok: false, msg: '切换本地模式或更换链接时，请先由浏览器拉取内容，不会回退到 Cloudflare 拉取' }, 400)
       if (body.name !== undefined) u.name = String(body.name).trim().slice(0, 30) || u.name
-      if (body.auto !== undefined) u.auto = !!body.auto
+      if (body.updateMode !== undefined) { u.updateMode = mode; u.auto = mode === 'auto' }
+      else if (body.auto !== undefined && mode !== 'local') { u.auto = !!body.auto; if (u.updateMode) u.updateMode = u.auto ? 'auto' : 'manual' }
       const pasted = String(body.text || '').trim()
       if (pasted) {
         // 粘贴优先于换链接：既然内容已经在手上，就不必再赌一次能不能拉通
         const r = parsePasted(pasted, u)
         if (r.err) return json({ ok: false, msg: r.err }, 400)
+        if (body.userinfo && typeof body.userinfo === 'string' && body.userinfo.length <= 1024) r.got.info = mergeMeta(parseUserinfo(body.userinfo), r.got.info)
         if (body.url && /^https?:\/\//.test(body.url)) u.url = body.url
         u.auto = false
+        if (u.updateMode && u.updateMode !== 'local') u.updateMode = 'manual'
         addedN = r.got.nodes.length
-        await saveSnap(u.id, r.got, event)
+        if (u.updateMode === 'local') {
+          try { await saveSnap(u.id, r.got, null) }
+          catch (e) { return json({ ok: false, msg: '本地快照保存失败，原订阅源与缓存保持不变，请稍后重试' }, 503) }
+        } else await saveSnap(u.id, r.got, event)
       } else if (body.url && body.url !== u.url) {
         if (!/^https?:\/\//.test(body.url)) return json({ ok: false, msg: '链接需以 http(s):// 开头' }, 400)
         // 换链接就立刻拉一次并刷新快照。一次性链接的整个使用方式就是
@@ -2676,6 +2728,7 @@ async function apiRoute(req, url, event) {
     if (!u) return json({ ok: false, msg: '订阅源不存在' }, 404)
     const snap = await kvGet('snap:' + id, null)
     const snapInfo = snap && snap.nodes ? { at: snap.at, n: snap.nodes.length } : null
+    if (upstreamUpdateMode(u) === 'local') return json({ ok: true, name: u.name, local: true, http: 0, tries: [], snap: snapInfo, err: '本地模式不从 Cloudflare 请求上游；请点击使用本地网络拉取更新' })
     // 每种客户端身份都试一遍并把结果摊开：机场是拒绝了我们，还是给了一份
     // 我们解析不了的格式，这两件事在 UI 上长得一样，不摊开就只能靠猜。
     const tries = []
@@ -4359,6 +4412,82 @@ function genShare(up, ownCfg, st) {
   const own = Object.values(ownCfg || {}).map(o => ({ name: o.name, own: true, o: { ...o, s: o.s } }))
   const links = [...own, ...up].map(shareLink).filter(Boolean)
   return b64utf8(links.join('\n'))
+}
+
+function runLocalFetch(allowedOrigin) {
+  const status = document.getElementById('local-status')
+  if (!window.opener) { status.textContent = '请从管理页选择使用本地网络拉取。'; return }
+  const parentOrigin = location.origin
+  let started = false
+  window.addEventListener('message', async event => {
+    if (started || event.source !== window.opener || event.origin !== parentOrigin || event.data?.kind !== 'local-feed-start') return
+    const { url, requestId } = event.data
+    if (typeof requestId !== 'string' || requestId.length > 80) return
+    started = true
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 20000)
+    const send = value => window.opener.postMessage({ kind: 'local-feed-result', requestId, ...value }, parentOrigin)
+    try {
+      const target = new URL(url)
+      if (target.origin !== allowedOrigin || target.username || target.password) throw new Error('订阅站点与授权范围不一致')
+      status.textContent = '正在使用浏览器当前网络下载订阅；不会使用 Cloudflare 出口。'
+      const response = await fetch(target.href, { mode: 'cors', credentials: 'omit', referrerPolicy: 'no-referrer', redirect: 'error', cache: 'no-store', signal: controller.signal })
+      if (!response.ok) throw new Error('订阅站点返回 HTTP ' + response.status)
+      if (Number(response.headers.get('Content-Length')) > 2 * 1024 * 1024) throw new Error('订阅内容不能超过 2MB')
+      const reader = response.body.getReader(), decoder = new TextDecoder()
+      let size = 0, text = ''
+      while (true) {
+        const part = await reader.read()
+        if (part.done) break
+        size += part.value.byteLength
+        if (size > 2 * 1024 * 1024) { await reader.cancel(); throw new Error('订阅内容不能超过 2MB') }
+        text += decoder.decode(part.value, { stream: true })
+      }
+      text += decoder.decode()
+      if (!text.trim()) throw new Error('订阅站点返回了空内容')
+      send({ ok: true, text, userinfo: response.headers.get('Subscription-Userinfo') || '' })
+      status.textContent = '已下载，正在交回管理页保存。'
+    } catch (e) {
+      const error = e.name === 'AbortError' ? '本地拉取超时，请检查当前网络' : e.name === 'TypeError' ? '浏览器无法读取订阅：站点可能未允许 CORS 跨域，或存在网络、TLS、重定向限制。未改用 Cloudflare 拉取。' : e.message
+      status.textContent = error
+      send({ ok: false, error })
+    } finally { clearTimeout(timer) }
+  })
+  window.opener.postMessage({ kind: 'local-feed-ready' }, parentOrigin)
+}
+
+function localFetchHTML(origin) {
+  return '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>使用本地网络拉取</title><style>body{font:15px/1.7 sans-serif;max-width:38em;margin:40px auto;padding:0 24px;color:#292524;background:#faf8f5}h1{font-size:20px}p{overflow-wrap:anywhere}</style><h1>使用本地网络拉取</h1><p id="local-status">等待管理页发送请求。完整订阅链接不会放进此窗口地址。</p><p>不要关闭窗口；站点须允许浏览器跨域读取，成功后会自动返回。</p><script>(' + runLocalFetch.toString() + ')(' + JSON.stringify(origin) + ')</script></html>'
+}
+
+function installLocalFetchClient() {
+  window.pullLocalSubscription = url => {
+    let target
+    try { target = new URL(url) } catch (e) { return Promise.reject(new Error('请填写有效的 HTTPS 订阅链接')) }
+    const local = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname) && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(target.hostname)
+    if ((target.protocol !== 'https:' && !(local && target.protocol === 'http:')) || target.username || target.password || target.origin === location.origin)
+      return Promise.reject(new Error('本地拉取需要不含账号密码的 HTTPS 订阅链接'))
+    return new Promise((resolve, reject) => {
+      const requestId = crypto.randomUUID()
+      let popup, timer, closed
+      const finish = (error, data) => {
+        clearTimeout(timer); clearInterval(closed); window.removeEventListener('message', receive)
+        if (popup && !popup.closed) popup.close()
+        if (error) reject(new Error(error)); else resolve(data)
+      }
+      const receive = event => {
+        if (event.origin !== location.origin || event.source !== popup) return
+        if (event.data?.kind === 'local-feed-ready') popup.postMessage({ kind: 'local-feed-start', requestId, url: target.href }, location.origin)
+        if (event.data?.kind === 'local-feed-result' && event.data.requestId === requestId)
+          finish(event.data.ok ? '' : event.data.error || '本地拉取失败', { text: event.data.text, userinfo: event.data.userinfo || '' })
+      }
+      window.addEventListener('message', receive)
+      popup = window.open('/admin/local-fetch?origin=' + encodeURIComponent(target.origin), '_blank', 'popup,width=560,height=420')
+      if (!popup) { finish('浏览器阻止了拉取窗口，请允许本站弹出窗口后重试'); return }
+      timer = setTimeout(() => finish('本地拉取未完成。请检查登录状态、网络及订阅站点的 CORS 设置；未改用 Cloudflare 拉取。'), 30000)
+      closed = setInterval(() => { if (popup.closed) finish('拉取窗口已关闭，未保存或改用 Cloudflare 拉取') }, 500)
+    })
+  }
 }
 
 // Installed into the existing page scope; keeping this as JS avoids nested-template escaping bugs.
@@ -6049,11 +6178,11 @@ function upRow(u, i){
   return \`<div class="up src \${u.enabled===false?'off':''}" data-id="\${esc(u.id)}" data-i="\${i||0}" draggable="false">
       <span class="grip" data-tip="拖动调整顺序">\${icon('grip','s')}</span>
       <span class="dot \${err && !snapAt ? 'bad' : ''}"></span>
-      <span class="nm">\${esc(u.name)}\${u.auto===false?'<span class="tag manual" data-tip="不参与自动刷新，固定使用快照">手动</span>':''}</span>
+      <span class="nm">\${esc(u.name)}\${u.updateMode==='local'?'<span class="tag manual" data-tip="仅浏览器本地网络拉取，Cloudflare 只读取快照">本地</span>':u.auto===false?'<span class="tag manual" data-tip="不参与自动刷新，固定使用快照">手动</span>':''}</span>
       <span class="u">\${u.url ? esc(maskUrl(u.url)) : '<span class="mute">粘贴导入 · 无链接</span>'}\${snapAt?\`<span class="snap">快照 \${ago(snapAt)}</span>\`:''}\${err?\`<span class="err" role="button" tabindex="0" onclick="probeUp(\${jsq(u.id)})">\${err.msg.includes('沿用快照') ? '拉取失败，用快照' : '拉取失败'}</span>\`:''}</span>
       \${upMeta((ST.meta || {})[u.id], u.id)}
       <button class="sw" data-on="\${u.enabled===false?0:1}" data-tip="\${u.enabled===false?'启用':'停用'}" role="switch" aria-checked="\${u.enabled!==false}" aria-label="启用这个订阅源" onclick="upAct('toggle',\${jsq(u.id)},this)"><i></i></button>
-      <button class="ib" data-tip="编辑" aria-label="编辑" onclick="editUp(\${jsq(u.id)})">\${icon('edit')}</button>
+      <span class="acts">\${u.updateMode==='local'?\`<button class="ib" data-tip="使用本地网络拉取" aria-label="使用本地网络拉取" onclick="pullUpLocal(\${jsq(u.id)},this)">\${icon('refresh')}</button>\`:''}<button class="ib" data-tip="编辑" aria-label="编辑" onclick="editUp(\${jsq(u.id)})">\${icon('edit')}</button></span>
       <button class="ib dl" data-tip="删除" aria-label="删除" onclick="delUp(\${jsq(u.id)})">\${icon('trash')}</button>
     </div>\`
 }
@@ -7045,7 +7174,8 @@ window.editSettings = async () => {
   toast('已保存'); dash(true)
 }
 
-${"(" + installOwnEditor.toString().replace(/\n  /g, '\n') + ")()"}
+${"(" + installOwnEditor.toString().replace(/\n  /g, '\n') + ")();"}
+${"(" + installLocalFetchClient.toString() + ")();"}
 
 window.delOwn = async (key) => {
   const n = ((OWN && OWN.own) || {})[key] || { name: key }
@@ -7286,6 +7416,26 @@ window.importBackup = () => {
 }
 
 // ================= 订阅源 =================
+const UP_UPDATE_OPTIONS = [
+  {v:'1', label:'自动更新 — 每小时拉取最新节点'},
+  {v:'0', label:'手动 — 只用快照，不自动拉取'},
+  {v:'local', label:'使用本地网络拉取 — 浏览器下载并保存快照'}
+]
+const upModeValue = u => u.updateMode === 'local' ? 'local' : u.auto === false ? '0' : '1'
+const upModeName = v => v === 'local' ? 'local' : v === '1' ? 'auto' : 'manual'
+const upModeHTML = value => \`<div class="fg"><label class="lb">更新方式</label>\${selectHTML('ua', UP_UPDATE_OPTIONS, value)}<div class="hint" id="uah"></div></div>\`
+function bindUpMode(b, snapAt){
+  bindSelect(b)
+  const sync = () => {
+    const value = selValue(b.querySelector('#ua'))
+    b.querySelector('#uah').textContent = value === 'local'
+      ? '添加、更换链接或点击本地拉取时，由浏览器当前网络下载；只改名称不下载。页面关闭后不自动更新。需允许本站弹出临时窗口及站点 CORS；失败不会改用 Cloudflare。'
+      : value === '1' ? '由 Cloudflare 每小时自动拉取；部分订阅站点可能阻止 CF 出口。'
+      : '适合一次性链接：平时只使用快照；更换链接或粘贴内容时更新。' + (snapAt ? ' 当前快照抓于 ' + ago(snapAt) + '。' : '尚无快照时会先尝试拉取一次。')
+  }
+  b.querySelectorAll('#ua .selo').forEach(o => o.addEventListener('click', () => setTimeout(sync, 0)))
+  sync()
+}
 window.addUp = async () => {
   const html = \`
     <div class="fg"><label class="lb" for="un">名称<span class="opt">可留空</span></label>
@@ -7293,20 +7443,26 @@ window.addUp = async () => {
     <div class="fg"><label class="lb" for="uu">订阅链接</label>
       <input id="uu" class="mono" placeholder="https://..." spellcheck="false" autocomplete="off">
       <div class="hint">保存前会先试拉一次，确认能解析出节点。</div></div>
+    \${upModeHTML('1')}
     <div class="fg"><label class="lb" for="ut">或粘贴订阅内容</label>
       <textarea id="ut" placeholder="机场拦住本站时用这个：浏览器打开订阅链接 → 全选复制 → 粘到这里"></textarea>
       <div class="hint">填了这里就不走网络，直接解析贴进来的内容并存成快照。</div></div>\`
-  const box = await modal({ title:'添加订阅源', html, ok:'添加', wide:true, onSubmit: async b => {
+  const box = await modal({ title:'添加订阅源', html, ok:'添加', wide:true, onMount:b => bindUpMode(b), onSubmit: async b => {
     const name = b.querySelector('#un').value.trim()
     const url = b.querySelector('#uu').value.trim()
-    const text = b.querySelector('#ut').value.trim()
+    let text = b.querySelector('#ut').value.trim(), userinfo = ''
+    const mode = selValue(b.querySelector('#ua'))
     if (!url && !text) return { msg:'订阅链接和订阅内容至少要填一个', field:'uu' }
     if (url && !/^https?:\\/\\//.test(url)) return { msg:'链接要以 http:// 或 https:// 开头', field:'uu' }
     // 第一次拉不通不直接判死刑，也不再叠一个弹窗 —— 这个表单本来就有粘贴框，
     // 就地把话说清楚：要么把内容粘进来，要么再点一次先加进来。
     const ok = b.querySelector('[data-ok]')
-    if (ok && !text) ok.textContent = '正在试拉…'
-    let r = await api('/api/upstreams', { act:'add', name, url, text, force: b.__retry ? 1 : 0 })
+    if (mode === 'local' && !text) {
+      if (ok) ok.textContent = '正在本地拉取…'
+      try { const result = await pullLocalSubscription(url); text = result.text; userinfo = result.userinfo }
+      catch (e) { return { msg:e.message, field:'uu' } }
+    } else if (ok && !text) ok.textContent = '正在试拉…'
+    let r = await api('/api/upstreams', { act:'add', name, url, text, userinfo, updateMode:upModeName(mode), force: b.__retry ? 1 : 0 })
     if (!r.ok && (r.canPaste || r.canForce) && !b.__retry) {
       b.__retry = 1
       return { msg: r.msg + '。可以在浏览器里打开这个链接、全选复制，粘到下面的框里再保存；或者直接再点一次「添加」先把它加进来（暂时不会有节点）。', field:'ut' }
@@ -7322,7 +7478,6 @@ window.addUp = async () => {
 window.editUp = async (id) => {
   const u = (ST.upstreams || []).find(x => x.id === id)
   if (!u) return
-  const auto = u.auto !== false
   const snapAt = (ST.snaps || {})[id]
   const html = \`
     <div class="fg"><label class="lb" for="un">名称</label>
@@ -7330,34 +7485,27 @@ window.editUp = async (id) => {
     <div class="fg"><label class="lb" for="uu">订阅链接</label>
       <input id="uu" class="mono" value="\${esc(u.url)}" placeholder="https://..." spellcheck="false" autocomplete="off">
       <div class="hint">改动链接会立即拉取一次并刷新快照。</div></div>
-    <div class="fg"><label class="lb">更新方式</label>
-      \${selectHTML('ua', [
-        {v:'1', label:'自动更新 — 每小时拉取最新节点'},
-        {v:'0', label:'手动 — 只用快照，不自动拉取'}
-      ], auto ? '1' : '0')}
-      <div class="hint" id="uah"></div></div>
+    \${upModeHTML(upModeValue(u))}
     <div class="fg"><label class="lb" for="ut">或粘贴订阅内容</label>
       <textarea id="ut" placeholder="机场拦住本站时用这个：浏览器打开订阅链接 → 全选复制 → 粘到这里"></textarea>
-      <div class="hint">填了这里就不走网络，直接用贴进来的内容刷新快照，更新方式自动转为手动。</div></div>\`
+      <div class="hint">填写后直接保存内容，不请求上游；本地模式保持不变，其他模式转为手动快照。</div></div>\`
   const box = await modal({ title:'编辑订阅源', html, ok:'保存', wide:true, onMount: b => {
-    bindSelect(b)
-    const sync = () => {
-      b.querySelector('#uah').innerHTML = selValue(b.querySelector('#ua')) === '1'
-        ? '常规机场用这个。链接长期有效，每小时自动拉一次。'
-        : \`适合<b>有效期只有几分钟的一次性链接</b>：平时完全不请求它，固定使用快照。\${snapAt?'当前快照抓于 '+ago(snapAt)+'。':'目前还没有快照，保存后会先拉一次。'}需要更新节点时，回机场复制新链接贴到上面即可。\`
-    }
-    b.querySelectorAll('#ua .selo').forEach(o => o.addEventListener('click', () => setTimeout(sync, 0)))
-    sync()
+    bindUpMode(b, snapAt)
   }, onSubmit: async b => {
     const name = b.querySelector('#un').value.trim()
     const url = b.querySelector('#uu').value.trim()
-    const text = b.querySelector('#ut').value.trim()
-    const a = selValue(b.querySelector('#ua')) === '1'
+    let text = b.querySelector('#ut').value.trim(), userinfo = ''
+    const mode = selValue(b.querySelector('#ua'))
     // 粘贴导入的源本来就没有链接，只改名字或更新方式时两样都不用填。
     // 原本有链接却被清空才拦：服务端收到空链接是保持原样，不拦的话用户会以为删掉了
     if (!url && !text && u.url) return { msg:'订阅链接和订阅内容至少要填一个', field:'uu' }
     if (url && !/^https?:\\/\\//.test(url)) return { msg:'链接要以 http:// 或 https:// 开头', field:'uu' }
-    let r = await api('/api/upstreams', { act:'edit', id, name, url, auto:a, text, force: b.__retry ? 1 : 0 })
+    if (mode === 'local' && !text && (u.updateMode !== 'local' || url !== u.url)) {
+      b.querySelector('[data-ok]').textContent = '正在本地拉取…'
+      try { const result = await pullLocalSubscription(url); text = result.text; userinfo = result.userinfo }
+      catch (e) { return { msg:e.message, field:'uu' } }
+    }
+    let r = await api('/api/upstreams', { act:'edit', id, name, url, auto:mode==='1', updateMode:upModeName(mode), expectedUrl:u.url, expectedMode:upModeName(upModeValue(u)), text, userinfo, force: b.__retry ? 1 : 0 })
     if (!r.ok && (r.canPaste || r.canForce) && !b.__retry) {
       b.__retry = 1
       return { msg: r.msg + '。可以在浏览器里打开这个链接、全选复制，粘到下面的框里再保存；或者直接再点一次「保存」（在拿到能用的链接前它不会有新节点）。', field:'ut' }
@@ -7369,6 +7517,20 @@ window.editUp = async (id) => {
   if (!box) return
   toast(box.__up && box.__up.n ? \`已保存，抓到 \${box.__up.n} 个节点\` : '已保存')
   await syncUp(null)
+}
+window.pullUpLocal = async (id, button) => {
+  const u = (ST.upstreams || []).find(x => x.id === id)
+  if (!u || u.updateMode !== 'local') return
+  const sourceUrl = u.url
+  if (button) button.disabled = true
+  try {
+    const content = await pullLocalSubscription(sourceUrl)
+    const result = await api('/api/upstreams', { act:'edit', id, updateMode:'local', localRefresh:true, expectedUrl:sourceUrl, expectedMode:'local', text:content.text, userinfo:content.userinfo })
+    if (!result.ok) throw new Error(result.msg || '本地内容保存失败')
+    toast('已使用本地网络更新快照')
+    await syncUp(null)
+  } catch (e) { toast(e.message, true) }
+  finally { if (button) button.disabled = false }
 }
 window.delUp = async (id) => {
   const u = (ST.upstreams || []).find(x => x.id === id) || { name: id }
@@ -7424,7 +7586,7 @@ window.probeUp = async (id) => {
     if (r.snap) h += row('本地快照', \`\${r.snap.n} 个节点，抓于 \${ago(r.snap.at)}\` + (r.http === 0 ? ' —— 拉不通时订阅仍靠它供节点' : ''))
     if (r.http === 0) {
       h += row('结果', '请求失败：' + (r.err || '未知错误'))
-      h += row('怎么办', '机场可能挡住了 Cloudflare 的出站请求。在浏览器里打开订阅链接、全选复制，到「编辑订阅源」里粘贴内容即可。')
+      h += row('怎么办', r.local ? '该源不会从 Cloudflare 拉取。请点击订阅源旁的「使用本地网络拉取」，由浏览器下载并更新快照。' : '机场可能挡住了 Cloudflare 的出站请求。在浏览器里打开订阅链接、全选复制，到「编辑订阅源」里粘贴内容即可。')
     } else {
       h += row('采用', \`\${uaName(r)} 这一份\`)
       h += row('HTTP', r.http) + row('响应格式', r.fmt) + row('大小', r.bytes + ' 字节') + row('解析到节点', r.nodes + ' 个')
@@ -7509,11 +7671,12 @@ window.rename = (btn) => {
   inp.addEventListener('blur', () => fin(true))
 }
 window.refresh = async (b) => {
+  const hasLocal = ((ST && ST.upstreams) || []).some(u => u.enabled !== false && u.updateMode === 'local')
   b.disabled = true
   b.querySelector('svg').classList.add('spin')
   const r = await api('/api/refresh', {})
   const errs = (r.errors || []).length
-  toast(r.ok ? \`已拉取 \${r.count} 个节点\${errs ? \`，\${errs} 个源失败\` : ''}\` : (r.msg || '拉取失败'), !r.ok || !!errs)
+  toast(r.ok ? \`已刷新 \${r.count} 个节点\${errs ? \`，\${errs} 个源失败\` : ''}\${hasLocal ? '；本地源沿用快照，请单独本地拉取' : ''}\` : (r.msg || '拉取失败'), !r.ok || !!errs)
   ST = null; dash(true)
 }
 

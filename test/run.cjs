@@ -2112,6 +2112,7 @@ sec('51. 表单读取的元素必须在模板里存在')
     const defined = new Set(dynamic)
     for (const x of body.matchAll(/id="([\w-]+)"/g)) defined.add(x[1])
     for (const x of body.matchAll(/(?:selectHTML|chipsHTML|ta|input|select|toggle)\('([\w-]+)'/g)) defined.add(x[1])
+    if (/upModeHTML\(/.test(body)) { defined.add('ua'); defined.add('uah') }
     const used = new Set()
     for (const x of body.matchAll(/querySelector(?:All)?\('#([\w-]+)/g)) used.add(x[1])
     for (const x of body.matchAll(/\b(?:val|put)\('([\w-]+)'/g)) used.add(x[1])
