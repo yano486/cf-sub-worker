@@ -231,17 +231,17 @@ VLESS 的协议加密字段是 `encryption`，VMess 的加密方式来自 `scy`�
 ## 开发
 
 ```bash
-node dev/server.mjs                     # 本地预览 http://localhost:8787/admin，密码 devpassword
+node dev/server.mjs                             # 本地预览 http://localhost:8787/admin，密码 devpassword
 npm install --prefix test && node test/run.cjs  # 单元与接口测试
-node --test test/own-protocols.cjs       # 自有节点多协议保存、导入、输出与兼容回归
-node --test test/import-compatibility.cjs # 官方分享链接字段与扩展参数导入回归
-node --test test/encryption-path.cjs     # 加密字段、路径编码与 WebSocket 路径归一回归
-node --test test/security-hardening.cjs   # HTTPS、权威状态故障关闭与诊断最小输出回归
-node --test test/local-network.cjs       # 本地模式、CSP、快照写入、冲突与浏览器消息流程回归
-node test/e2e.mjs                       # 端到端：在无头 Chrome 里把管理端完整点一遍（需本机有 Chrome）
-node scripts/build-demo.mjs             # 重新生成 docs/demo.html
-node scripts/shots.mjs                  # 重新生成 README 截图
-bash deploy.sh                          # 部署
+node --test test/own-protocols.cjs              # 自有节点多协议保存、导入、输出与兼容回归
+node --test test/import-compatibility.cjs       # 官方分享链接字段与扩展参数导入回归
+node --test test/encryption-path.cjs            # 加密字段、路径编码与 WebSocket 路径归一回归
+node --test test/security-hardening.cjs         # HTTPS、权威状态故障关闭与诊断最小输出回归
+node --test test/local-network.cjs              # 本地模式、CSP、快照写入、冲突与浏览器消息流程回归
+node test/e2e.mjs                               # 端到端：在无头 Chrome 里把管理端完整点一遍（需本机有 Chrome）
+node scripts/build-demo.mjs                     # 重新生成 docs/demo.html
+node scripts/shots.mjs                          # 重新生成 README 截图
+bash deploy.sh                                  # 部署
 ```
 
 `worker.js` 单文件承载全部逻辑 —— Workers 部署一个 JS 文件最省事，也免去打包步骤。改完先跑测试再部署。
