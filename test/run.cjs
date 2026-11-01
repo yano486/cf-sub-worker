@@ -2107,12 +2107,14 @@ sec('51. 表单读取的元素必须在模板里存在')
   // 直连域名、直连 IP、强制代理域名一样都存不进去。正则扫不出这种错，只能逐个表单对账。
   const ui = T.adminHTML(true, true)
   const dynamic = T.DNS_GROUPS.map(g => 'dg_' + g.k)     // editDns 按分组拼出来的 id
+  const upModeTemplate = ui.slice(ui.indexOf('const upModeHTML ='), ui.indexOf('function bindUpMode('))
   const bad = [], checked = []
   for (const { name, body } of uiBlocks()) {
     const defined = new Set(dynamic)
     for (const x of body.matchAll(/id="([\w-]+)"/g)) defined.add(x[1])
     for (const x of body.matchAll(/(?:selectHTML|chipsHTML|ta|input|select|toggle)\('([\w-]+)'/g)) defined.add(x[1])
-    if (/upModeHTML\(/.test(body)) { defined.add('ua'); defined.add('uah') }
+    if (/upModeHTML\(/.test(body) || name === 'bindUpMode')
+      for (const x of upModeTemplate.matchAll(/id="([\w-]+)"|selectHTML\('([\w-]+)'/g)) defined.add(x[1] || x[2])
     const used = new Set()
     for (const x of body.matchAll(/querySelector(?:All)?\('#([\w-]+)/g)) used.add(x[1])
     for (const x of body.matchAll(/\b(?:val|put)\('([\w-]+)'/g)) used.add(x[1])

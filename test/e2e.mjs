@@ -73,6 +73,62 @@ try {
     inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' })); await __until(() => /已重命名/.test(__toast()))
     const row = [...document.querySelectorAll('#nodecard .nd')].find(x => x.dataset.k === k)
     return { '名字更新': row && /改过的名字/.test(row.textContent), '标记自定义': row && !!row.querySelector('.tag') }`)
+  await step('本地更新：站内确认与取消', `localStorage.removeItem('cfsub-local-risk-v1'); addUp(); await __until(__top); const form = __top()
+    const realFetch = window.fetch, realOpen = window.open, requests = []
+    window.fetch = (...args) => { requests.push('fetch'); return realFetch(...args) }
+    window.open = (...args) => { requests.push('open'); return realOpen(...args) }
+    form.querySelector('#un').value = '保留未保存的名称'
+    form.querySelector('#ua .selb').click(); document.querySelector('.selp.portal .selo[data-v="local"]').click()
+    const shown = await __until(() => __top() !== form && __top(), 1000)
+    if (!shown) { window.fetch = realFetch; window.open = realOpen; await __close(); return { '切换时出现站内风险确认框': false } }
+    const warning = shown.textContent
+    const untouched = ST.upstreams.length === 2 && form.querySelector('#ua').dataset.v === '1'
+    shown.querySelector('[data-x]').click(); await __until(() => __top() === form)
+    const result = { '说明 CORS、出口 IP 和 KV 保存边界': /CORS/.test(warning) && /IP/.test(warning) && /KV/.test(warning),
+      '确认前不改变方式或订阅源': untouched, '取消恢复原方式': form.querySelector('#ua').dataset.v === '1',
+      '取消不丢失表单': form.querySelector('#un').value === '保留未保存的名称', '确认与取消都不发起网络或拉取窗口': requests.length === 0 }
+    window.fetch = realFetch; window.open = realOpen
+    await __close(); return result`)
+  await step('本地更新：重复提醒与本机偏好', `localStorage.removeItem('cfsub-local-risk-v1'); addUp(); await __until(__top); const form = __top()
+    const choose = v => { form.querySelector('#ua .selb').click(); document.querySelector('.selp.portal .selo[data-v="' + v + '"]').click() }
+    choose('local'); const warning = await __until(() => __top() !== form && __top(), 1000)
+    if (!warning) { await __close(); return { '本地方式需要明确确认': false } }
+    warning.querySelector('[data-ok]').click(); await __until(() => __top() === form && form.querySelector('#ua').dataset.v === 'local')
+    const checkbox = form.querySelector('#ualrisk'), row = checkbox.closest('label')
+    const first = !checkbox.checked && row.offsetHeight > 0
+    choose('1'); await __w(50); const hidden = row.offsetHeight === 0
+    choose('local'); const repeated = await __until(() => __top() !== form && __top(), 1000)
+    if (!repeated) { await __close(); return { '未勾选时每次切换都提醒': false } }
+    repeated.querySelector('[data-ok]').click(); await __until(() => __top() === form)
+    row.querySelector('span:last-child').click(); const saved = checkbox.checked && localStorage.getItem('cfsub-local-risk-v1') === '1'
+    choose('0'); await __w(50); choose('local'); await __w(80)
+    const skipped = __top() === form && form.querySelector('#ua').dataset.v === 'local'
+    await __close(); addUp(); await __until(__top); const second = __top()
+    second.querySelector('#ua .selb').click(); document.querySelector('.selp.portal .selo[data-v="local"]').click(); await __w(80)
+    const persisted = __top() === second && second.querySelector('#ualrisk').checked
+    second.querySelector('#ualrisk').focus(); second.querySelector('#ualrisk').click()
+    const reset = localStorage.getItem('cfsub-local-risk-v1') === null
+    await __close()
+    return { '确定后显示默认未勾选的统一控件': first, '非本地方式隐藏控件': hidden,
+      '勾选文字可保存本机偏好': saved, '勾选后跳过确认': skipped, '重新打开表单仍记住偏好': persisted,
+      '取消勾选恢复提醒': reset }`)
+  await step('本地更新：编辑与存储失败', `localStorage.removeItem('cfsub-local-risk-v1'); editUp('a1'); await __until(__top); const form = __top()
+    form.querySelector('#ua .selb').click(); document.querySelector('.selp.portal .selo[data-v="local"]').click()
+    const warning = await __until(() => __top() !== form && __top(), 1000)
+    if (!warning) { await __close(); return { '编辑使用同一风险确认流程': false } }
+    warning.querySelector('[data-ok]').click(); await __until(() => __top() === form)
+    const original = Storage.prototype.setItem
+    Storage.prototype.setItem = function(k, v) { if (k === 'cfsub-local-risk-v1') throw new Error('Synthetic storage failure'); return original.call(this, k, v) }
+    form.querySelector('#ualrisk').click(); Storage.prototype.setItem = original
+    const result = { '存储失败不假装记住偏好': !form.querySelector('#ualrisk').checked && localStorage.getItem('cfsub-local-risk-v1') === null,
+      '存储失败有明确提示': /无法保存/.test(__toast()), '没有保存或改动现有源': !ST.upstreams[0].updateMode }
+    await __close(); return result`)
+  await b.run(`localStorage.setItem('cfsub-local-risk-v1', '1')`)
+  await page('node')
+  await step('本地更新：刷新后不重复弹窗', `addUp(); await __until(__top); const form = __top()
+    form.querySelector('#ua .selb').click(); document.querySelector('.selp.portal .selo[data-v="local"]').click(); await __w(80)
+    const result = __top() === form && form.querySelector('#ualrisk').checked && form.querySelector('#ua').dataset.v === 'local'
+    form.querySelector('#ualrisk').click(); await __close(); return result`)
   await step('添加订阅源：拉不通就地提示，粘贴后成功', `addUp(); await __until(__top); const m = __top()
     m.querySelector('#uu').value = 'https://blocked.example/sub'; await __ok()
     const err = (m.querySelector('.ferr') || {}).textContent || ''
@@ -252,6 +308,44 @@ try {
   sec('暗色')
   await page('node', { dark: true })
   await step('跟随系统进入暗色', `return document.documentElement.dataset.theme === 'dark' && getComputedStyle(document.body).backgroundColor === 'rgb(27, 26, 24)'`)
+
+  sec('本地拉取风险提示：布局与键盘')
+  for (const [name, opt] of [['desktop-light', { w:1100, h:900 }], ['mobile-dark', { w:390, h:844, mobile:true, dark:true }]]) {
+    await page('node', opt)
+    await step(name + ' 风险确认布局', `localStorage.removeItem('cfsub-local-risk-v1'); addUp(); await __until(__top); const form = __top()
+      form.querySelector('#ua .selb').click(); document.querySelector('.selp.portal .selo[data-v="local"]').click()
+      const warning = await __until(() => __top() !== form && __top(), 1000)
+      if (!warning) return false
+      await __until(() => warning.contains(document.activeElement) && !document.querySelector('.bd.out'))
+      const r = warning.getBoundingClientRect(), ct = warning.querySelector('.ct')
+      return { '弹窗在视口内': r.left >= 0 && r.right <= innerWidth + 1 && r.top >= 0 && r.bottom <= innerHeight + 1,
+        '正文不横向溢出': ct.scrollWidth <= ct.clientWidth + 1,
+        '底层表单不可误操作': form.inert,
+        '两层弹窗标题关联独立': warning.getAttribute('aria-labelledby') !== form.getAttribute('aria-labelledby') }`)
+    if (process.env.E2E_SCREENSHOT_DIR) {
+      fs.mkdirSync(process.env.E2E_SCREENSHOT_DIR, { recursive:true })
+      const shot = await b.send('Page.captureScreenshot', { format:'png' })
+      fs.writeFileSync(path.join(process.env.E2E_SCREENSHOT_DIR, name + '-warning.png'), Buffer.from(shot.data, 'base64'))
+    }
+    await step(name + ' 复选框样式', `const warning = __top(); warning.querySelector('[data-ok]').click()
+      await __until(() => __top() && !__top().inert && __top().querySelector('#ua').dataset.v === 'local')
+      await __until(() => !document.body.contains(warning))
+      const form = __top(), input = form.querySelector('#ualrisk'), row = input.closest('label'), box = input.nextElementSibling
+      const r = row.getBoundingClientRect(), css = getComputedStyle(box)
+      input.focus()
+      return { '复用统一复选框样式': css.width === '18px' && css.height === '18px' && getComputedStyle(row).display === 'flex',
+        '文字没有横向溢出': r.left >= 0 && r.right <= innerWidth && row.scrollWidth <= row.clientWidth + 1,
+        '可使用键盘聚焦': document.activeElement === input }`)
+    if (process.env.E2E_SCREENSHOT_DIR) {
+      const shot = await b.send('Page.captureScreenshot', { format:'png' })
+      fs.writeFileSync(path.join(process.env.E2E_SCREENSHOT_DIR, name + '-checkbox.png'), Buffer.from(shot.data, 'base64'))
+    }
+    await b.send('Input.dispatchKeyEvent', { type:'keyDown', key:' ', code:'Space', windowsVirtualKeyCode:32 })
+    await b.send('Input.dispatchKeyEvent', { type:'keyUp', key:' ', code:'Space', windowsVirtualKeyCode:32 })
+    await step(name + ' 空格切换偏好', `const input = __top().querySelector('#ualrisk')
+      const saved = input.checked && localStorage.getItem('cfsub-local-risk-v1') === '1'
+      input.click(); await __close(); return saved && localStorage.getItem('cfsub-local-risk-v1') === null`)
+  }
 
   sec('页面错误')
   ok(b.errors.length === 0, '整个过程没有未捕获的异常或 console.error', b.errors.slice(0, 3).join(' | '))

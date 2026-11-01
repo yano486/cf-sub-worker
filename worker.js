@@ -5308,13 +5308,15 @@ function toast(msg, err){
   el.dataset.t = setTimeout(el.kill, err ? 4200 : 2600)
 }
 
+let modalId = 0
 function modal({title, desc, html = '', fields = [], ok = '确定', danger = false, wide = false, xl = false, noCancel = false, foot = '', onMount, onSubmit}){
   return new Promise(resolve => {
     const bd = document.createElement('div')
     const opener = document.activeElement
+    const titleId = 'mdt-' + ++modalId
     bd.className = 'bd'
-    bd.innerHTML = \`<div class="md \${xl?'xl':wide?'lg':''}" role="dialog" aria-modal="true" aria-labelledby="mdt">
-      <div class="hd"><h3 id="mdt">\${esc(title)}</h3>\${desc ? \`<p>\${esc(desc)}</p>\` : ''}
+    bd.innerHTML = \`<div class="md \${xl?'xl':wide?'lg':''}" role="dialog" aria-modal="true" aria-labelledby="\${titleId}">
+      <div class="hd"><h3 id="\${titleId}">\${esc(title)}</h3>\${desc ? \`<p>\${esc(desc)}</p>\` : ''}
         <button type="button" class="ib x" data-close aria-label="关闭">\${icon('x')}</button></div>
       <div class="ct">
         \${html ? \`<div class="bdy">\${html}</div>\` : ''}
@@ -7423,16 +7425,60 @@ const UP_UPDATE_OPTIONS = [
 ]
 const upModeValue = u => u.updateMode === 'local' ? 'local' : u.auto === false ? '0' : '1'
 const upModeName = v => v === 'local' ? 'local' : v === '1' ? 'auto' : 'manual'
-const upModeHTML = value => \`<div class="fg"><label class="lb">更新方式</label>\${selectHTML('ua', UP_UPDATE_OPTIONS, value)}<div class="hint" id="uah"></div></div>\`
+const LOCAL_RISK_KEY = 'cfsub-local-risk-v1'
+const upModeHTML = value => \`<div class="fg"><label class="lb">更新方式</label>\${selectHTML('ua', UP_UPDATE_OPTIONS, value)}<div class="hint" id="uah"></div>
+  <div id="ualriskrow" hidden><label class="own-check"><input id="ualrisk" type="checkbox"><span class="own-check-box" aria-hidden="true"></span><span>已了解风险，不再弹出提示</span></label>
+    <div class="hint">仅在此浏览器、此站点记住；取消勾选可恢复提醒，不影响其他设备。</div></div></div>\`
 function bindUpMode(b, snapAt){
   bindSelect(b)
+  const sel = b.querySelector('#ua'), remember = b.querySelector('#ualrisk')
+  let accepted = store.get(LOCAL_RISK_KEY, '') === '1', confirming = false, allowLocal = false
+  remember.checked = accepted
+  remember.onchange = () => {
+    try {
+      if (remember.checked) localStorage.setItem(LOCAL_RISK_KEY, '1')
+      else localStorage.removeItem(LOCAL_RISK_KEY)
+      accepted = remember.checked
+    } catch (e) {
+      remember.checked = accepted
+      toast('无法保存此浏览器的风险提示偏好，请检查浏览器存储设置。', true)
+    }
+  }
   const sync = () => {
-    const value = selValue(b.querySelector('#ua'))
+    const value = selValue(sel)
+    b.querySelector('#ualriskrow').hidden = value !== 'local'
     b.querySelector('#uah').textContent = value === 'local'
       ? '添加、更换链接或点击本地拉取时，由浏览器当前网络下载；只改名称不下载。页面关闭后不自动更新。需允许本站弹出临时窗口及站点 CORS；失败不会改用 Cloudflare。'
       : value === '1' ? '由 Cloudflare 每小时自动拉取；部分订阅站点可能阻止 CF 出口。'
       : '适合一次性链接：平时只使用快照；更换链接或粘贴内容时更新。' + (snapAt ? ' 当前快照抓于 ' + ago(snapAt) + '。' : '尚无快照时会先尝试拉取一次。')
   }
+  // Intercept before the select changes so cancellation leaves the form untouched.
+  b.querySelectorAll('#ua .selo[data-v="local"]').forEach(o => o.addEventListener('click', async e => {
+    if (allowLocal || accepted) return
+    e.preventDefault()
+    e.stopImmediatePropagation()
+    if (confirming) return
+    confirming = true
+    closeAllSel()
+    b.inert = true
+    try {
+      const confirmed = await modal({ title:'本地网络拉取风险提示', wide:true,
+        desc:'本地拉取通过浏览器跨域访问订阅站点（CORS）。请了解以下隐私与安全边界后再继续。',
+        html:\`<div class="alert">\${icon('warn')}<span>CORS 只是跨域读取许可，不代表来源可信或内容安全。请酌情使用，仅拉取你信任的订阅。</span></div>
+          <p><b>网络信息：</b>订阅站点可以看到浏览器当前的出口 IP（使用代理时为代理出口）及请求信息。</p>
+          <p><b>敏感凭据：</b>订阅链接通常包含访问令牌，返回的节点可能包含密码。不要将它们交给陌生中转站或公开分享。</p>
+          <p><b>保存位置：</b>下载结果和订阅链接仍会通过 HTTPS 上传本站，保存到你自己的 Cloudflare KV，并非仅留在本机。</p>
+          <p>确认已了解上述风险，请点击「确定」继续；取消不会切换更新方式，也不会发起下载。</p>\` })
+      if (confirmed && b.isConnected) {
+        allowLocal = true
+        try { o.click() } finally { allowLocal = false }
+      }
+    } finally {
+      b.inert = false
+      confirming = false
+      if (b.isConnected) sel.querySelector('.selb').focus({ preventScroll:true })
+    }
+  }, true))
   b.querySelectorAll('#ua .selo').forEach(o => o.addEventListener('click', () => setTimeout(sync, 0)))
   sync()
 }
