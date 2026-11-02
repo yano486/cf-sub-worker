@@ -17,7 +17,7 @@ jobs:
       - name: 单元与接口测试
         run: node test/run.cjs
       - name: 协议与安全回归
-        run: node --test test/own-protocols.cjs test/import-compatibility.cjs test/encryption-path.cjs test/security-hardening.cjs test/local-network.cjs
+        run: node --test test/own-protocols.cjs test/own-json.cjs test/adaptive-import.cjs test/yaml-multi.cjs test/client-options.cjs test/compatibility-mode.cjs test/ech-mapping.cjs test/ech-share.cjs test/reality-pq.cjs test/import-compatibility.cjs test/encryption-path.cjs test/security-hardening.cjs test/local-network.cjs
       # ubuntu-latest 自带 Google Chrome
       - name: 端到端测试
         run: node test/e2e.mjs

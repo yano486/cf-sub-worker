@@ -140,6 +140,105 @@ try {
     await __until(() => document.querySelectorAll('.uplist.src .up').length === 2); return document.querySelectorAll('.uplist.src .up').length === 2`)
   await step('抓取诊断', `probeUp('a1'); await __until(() => __top() && __top().querySelector('#pbx .uplist'), 6000)
     const t = __top().textContent; await __close(); return { '逐个身份试拉': /逐个身份试拉/.test(t), '解析到节点': /解析到节点/.test(t) }`)
+  await step('自有节点：统一添加菜单', `const button = document.querySelector('#ownadd'), menu = document.querySelector('#ownaddmenu')
+    if (!button || !menu) return false
+    button.click(); const shown = !menu.hidden && button.getAttribute('aria-expanded') === 'true'
+    const options = [...menu.querySelectorAll('button')].map(x => x.textContent.trim())
+    document.body.click()
+    return { '单个按钮包含箭头与添加文案': /添加/.test(button.textContent) && button.querySelector('svg') !== null,
+      '点击展开手动添加与 JSON 导入': shown && options.includes('手动添加') && options.includes('批量导入 JSON'),
+      '点击外部收起': menu.hidden && button.getAttribute('aria-expanded') === 'false' }`)
+  await step('自有节点：菜单键盘与鼠标入口', `const button = document.querySelector('#ownadd'), root = button.parentElement, menu = document.querySelector('#ownaddmenu')
+    button.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}))
+    const first = document.activeElement === menu.querySelector('button')
+    document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}))
+    const escaped = menu.hidden && document.activeElement === button
+    button.blur(); root.dispatchEvent(new PointerEvent('pointerenter',{pointerType:'mouse'}))
+    const hovered = !menu.hidden; button.click(); const clicked = !menu.hidden
+    root.dispatchEvent(new PointerEvent('pointerleave',{pointerType:'mouse'})); document.body.click()
+    return { '向下键选中第一项': first, 'Esc 关闭并还原焦点': escaped, '鼠标悬停展开': hovered, '悬停后点击仍保持菜单': clicked }`)
+  await step('自有节点：JSON 编辑不直接落库', `editOwn('usV2'); await __until(__top); const form = __top(), action = form.querySelector('#ownjson')
+    if (!action) { await __close(); return false }
+    action.click(); const editor = await __until(() => __top() !== form && __top())
+    if (!editor) { await __close(); return false }
+    const input = editor.querySelector('#ownjsontext'), example = editor.querySelector('#ownjsonexamples')
+    const loaded = JSON.parse(input.value).name === form.querySelector('#on').value
+    const oldName = form.querySelector('#on').value
+    input.value = JSON.stringify({name:'JSON草稿',type:'ss',s:'json.example.com',p:8388,u:'fictional',cipher:'aes-128-gcm',security:'none'})
+    editor.querySelector('[data-ok]').click(); await __until(() => __top() === form && form.querySelector('#on').value === 'JSON草稿')
+    const filled = form.querySelector('#os').value === 'json.example.com'
+    await __close()
+    return { '打开时加载当前草稿 JSON': loaded, '结构示例只读展示': !!example && !example.querySelector('textarea,input'),
+      '解析后填回节点表单': filled, '没有点击保存就不修改已有节点': OWN.own.usV2.name === oldName }`)
+  await step('自有节点：JSON 取消和协议表单往返', `const results = {}
+    for (const type of ['ss','vmess','hysteria2','anytls']) {
+      editOwn(null); await __until(__top); const form = __top()
+      form.querySelector('#ot .selb').click(); document.querySelector('.selp.portal .selo[data-v="' + type + '"]').click(); await __w(40)
+      form.querySelector('#on').value = 'Draft-' + type; form.querySelector('#os').value = type + '.example.com'
+      form.querySelector('#ou').value = type === 'vmess' ? '11111111-2222-3333-4444-555555555555' : 'fictional'
+      form.querySelector('#ownjson').click(); const editor = await __until(() => __top() !== form && __top())
+      const locked = form.inert
+      editor.querySelector('[data-x]').click(); await __until(() => __top() === form && !form.inert)
+      const retained = form.querySelector('#on').value === 'Draft-' + type && document.activeElement === form.querySelector('#ownjson')
+      form.querySelector('#ownjson').click(); const again = await __until(() => __top() !== form && __top())
+      again.querySelector('[data-ok]').click(); await __until(() => __top() === form || again.querySelector('.ferr'))
+      results[type + ' 草稿往返不丢字段'] = locked && retained && __top() === form && form.querySelector('#ot').dataset.v === type
+      if (__top() !== form) { __top().querySelector('[data-close]').click(); await __until(() => __top() === form) }
+      await __close()
+    }
+    return results`)
+  await step('自有节点：批量 JSON 预览和保存', `if (typeof importOwnJSON !== 'function') return false
+    const existing = JSON.stringify(OWN.own), before = Object.keys(OWN.own).length
+    importOwnJSON(); await __until(__top); const form = __top(), input = form.querySelector('#ownjsontext')
+    const placeholder = input.value === '' && /proxies|type/.test(input.placeholder)
+    input.value = JSON.stringify({proxies:[{name:'JSON-SS',type:'ss',server:'ss.example.com',port:8388,cipher:'aes-128-gcm',password:'fictional'},
+      {name:'JSON-VMess',type:'vmess',server:'vm.example.com',port:443,uuid:'11111111-2222-3333-4444-555555555555',alterId:0,cipher:'auto',tls:true,servername:'vm.example.com'}]})
+    form.querySelector('#ownjsonparse').click(); await __until(() => /2/.test(form.querySelector('#ownjsonpreview').textContent))
+    const untouched = JSON.stringify(OWN.own) === existing
+    await __ok(); await __until(() => OWN && Object.keys(OWN.own).length === before + 2)
+    const imported = Object.entries(OWN.own).filter(([,n]) => n.name.startsWith('JSON-'))
+    const persisted = await (await fetch('/api/own')).json()
+    const saved = imported.length === 2 && imported.every(([key,n]) => persisted.own[key].s === n.s)
+    for (const [key] of imported) { delOwn(key); await __until(__top); await __ok(); await __until(() => OWN && !OWN.own[key]) }
+    return { '空输入框含 JSON 占位例子': placeholder, '预览不写入节点': untouched, '一批节点统一保存并可读取': saved,
+      '原有节点完整保留': JSON.stringify(OWN.own) === existing }`)
+  await step('自有节点：批量保存期间锁定已确认内容', `importOwnJSON(); await __until(__top); const form = __top()
+    const input = form.querySelector('#ownjsontext'), parse = form.querySelector('#ownjsonparse')
+    input.value = JSON.stringify({name:'JSON-locked',type:'ss',s:'lock.example',p:8388,u:'fictional',cipher:'aes-128-gcm',security:'none'})
+    parse.click()
+    const realFetch = window.fetch; let release, observed = false, saves = []
+    window.fetch = async (url, opts) => {
+      if (url === '/api/own' && (!opts || !opts.method)) { observed = true; await new Promise(r => { release = r }) }
+      if (url === '/api/own' && opts && opts.method === 'POST') { saves.push(JSON.parse(opts.body)); return new Response(JSON.stringify({ok:false,msg:'Synthetic save failure'})) }
+      return realFetch(url, opts)
+    }
+    form.querySelector('[data-ok]').click(); await __until(() => observed)
+    const locked = input.disabled && parse.disabled && form.querySelector('[data-ok]').disabled
+    input.value = JSON.stringify({name:'JSON-unconfirmed',type:'ss',s:'other.example',p:8388,u:'fictional',cipher:'aes-128-gcm',security:'none'})
+    parse.click(); const stillLocked = form.querySelector('[data-ok]').disabled
+    release(); await __until(() => form.querySelector('.ferr'))
+    window.fetch = realFetch
+    const names = saves.length === 1 ? Object.values(saves[0].own).map(n => n.name) : []
+    const result = { '保存时输入与解析不可操作': locked && stillLocked,
+      '只提交已确认批次': names.includes('JSON-locked') && !names.includes('JSON-unconfirmed'),
+      '保存失败保留输入': input.value.includes('JSON-unconfirmed') && !input.disabled }
+    await __close(); return result`)
+  await step('自有节点：预览修改后必须重新解析', `importOwnJSON(); await __until(__top); const form = __top(), input = form.querySelector('#ownjsontext')
+    input.value = JSON.stringify({name:'JSON-first',type:'ss',s:'node.example',p:8388,u:'fictional',cipher:'aes-128-gcm'})
+    form.querySelector('#ownjsonparse').click(); const enabled = !form.querySelector('[data-ok]').disabled
+    input.value = '{}'; input.dispatchEvent(new Event('input',{bubbles:true}))
+    const invalidated = form.querySelector('[data-ok]').disabled
+    form.querySelector('#ownjsonparse').click(); const error = /节点|type/.test(form.querySelector('#ownjsonpreview').textContent)
+    await __close(); return { '成功解析才允许确认': enabled, '修改立即作废旧预览': invalidated, '错误清晰显示不保存': error }`)
+  await step('自有节点：POST 等待期间不误报保存失败', `const pending = ownJSONDialog(); await __until(__top); const form=__top(), input=form.querySelector('#ownjsontext')
+    input.value=JSON.stringify({name:'JSON-submit',type:'ss',s:'submit.example',p:8388,u:'fictional',cipher:'aes-128-gcm'})
+    form.querySelector('#ownjsonparse').click()
+    const realFetch=window.fetch; let release, posts=0
+    window.fetch=async (url,opts)=>{if(url==='/api/own'&&opts&&opts.method==='POST'){posts++;return new Promise(r=>{release=()=>r(new Response(JSON.stringify({ok:true})))})}return realFetch(url,opts)}
+    form.querySelector('[data-ok]').click(); await __until(()=>!!release)
+    input.value='{}'; input.dispatchEvent(new Event('input',{bubbles:true})); form.querySelector('#ownjsonparse').click(); form.querySelector('[data-ok]').click()
+    release(); const result=await pending; window.fetch=realFetch
+    return { '提交时重复操作没有多写': posts===1, '返回固定批次计数不误报失败': result && result.count===1 && !form.querySelector('.ferr') }`)
   await step('自有节点：分享链接导入后保存，再删除', `editOwn(null); await __until(__top); const m = __top()
     m.querySelector('#oimp').value = 'vless://11111111-2222-3333-4444-555555555555@v.example.net:443?security=reality&sni=www.example.com&pbk=PUBKEY0000000000000000000000000000000000000&sid=ab12&type=tcp&flow=xtls-rprx-vision#E2E-VLESS'
     m.querySelector('#oimpb').click(); await __until(() => m.querySelector('#on').value === 'E2E-VLESS')
@@ -148,6 +247,118 @@ try {
     const k = Object.keys(OWN.own).find(x => OWN.own[x].name === 'E2E-VLESS')
     delOwn(k); await __until(__top); await __ok(); await __until(() => document.querySelectorAll('.uplist.own .up').length === 3)
     return { '链接解析填表': filled, '保存后多一行': !!k, '删除后恢复': document.querySelectorAll('.uplist.own .up').length === 3 }`)
+  await step('Reality导入：后量子能力字段经过JSON和表单保存不丢失', `const uuid='11111111-2222-3333-4444-555555555555',pk='A'.repeat(43),count=Object.keys(OWN.own).length
+    editOwn(null);await __until(__top);const form=__top();form.querySelector('#ownjson').click();const editor=await __until(()=>__top()!==form&&__top())
+    editor.querySelector('#ownjsontext').value='    - { name: Reality-PQ-demo, type: vless, server: safe.example, port: 25565, uuid: '+uuid+', udp: true, flow: xtls-rprx-vision, tls: true, skip-cert-verify: false, client-fingerprint: firefox, servername: tls.example, reality-opts: { public-key: '+pk+', short-id: 0592b9f3, support-x25519mlkem768: true } }'
+    editor.querySelector('[data-ok]').click();await __until(()=>__top()===form&&form.querySelector('#on').value==='Reality-PQ-demo')
+    const filled=form.querySelector('#orealitypq')&&form.querySelector('#orealitypq').dataset.v==='1'&&form.querySelector('#osid').value==='0592b9f3'
+    await __ok();await __until(()=>OWN&&Object.keys(OWN.own).length===count+1);const key=Object.keys(OWN.own).find(k=>OWN.own[k].name==='Reality-PQ-demo')
+    const saved=OWN.own[key].realityPQ===true&&!OWN.own[key].clientOptions,url=new URL(OWN.links[key])
+    const shared=url.searchParams.get('security')==='reality'&&url.searchParams.get('pbk')===pk&&url.searchParams.get('sid')==='0592b9f3'&&url.searchParams.get('fp')==='firefox'
+    editOwn(key);await __until(__top);let edit=__top();edit.querySelector('#orealitypq .selb').click();document.querySelector('.selp.portal .selo[data-v="0"]').click();await __ok();await __until(()=>OWN&&OWN.own[key].realityPQ===false)
+    editOwn(key);await __until(__top);edit=__top();const reopened=edit.querySelector('#orealitypq').dataset.v==='0';edit.querySelector('#orealitypq .selb').click();document.querySelector('.selp.portal .selo[data-v=""]').click();await __ok();await __until(()=>OWN&&OWN.own[key].realityPQ===undefined)
+    const restored=OWN.own[key].realityPQ===undefined
+    delOwn(key);await __until(__top);await __ok();await __until(()=>OWN&&!OWN.own[key])
+    return {'单节点JSON填回识别true及ShortId':filled,'保存保留布尔值且不产生多余专用参数':saved,'分享保留标准Reality参数':shared,'编辑可保留false并恢复默认':reopened&&restored}`)
+  await step('证书风险：每次勾选立即确认且保存不重复提醒', `const before = Object.keys(OWN.own).length; editOwn(null); await __until(__top); const form=__top()
+    form.querySelector('#ot .selb').click(); document.querySelector('.selp.portal .selo[data-v="anytls"]').click(); await __w(40)
+    form.querySelector('#on').value='TLS-risk-demo'; form.querySelector('#os').value='risk.example'; form.querySelector('#ou').value='fictional'
+    form.querySelector('#ownadvanced').open=true
+    const realFetch=window.fetch; let writes=0
+    window.fetch=(url,opts)=>{if(url==='/api/own'&&opts&&opts.method==='POST')writes++;return realFetch(url,opts)}
+    form.querySelector('#oinsecure').click(); const warning=await __until(()=>__top()!==form&&__top(),1000)
+    if(!warning){window.fetch=realFetch;await __close();return {'勾选时立即显示站内风险提示':false}}
+    const text=warning.textContent, one=warning.querySelectorAll('button').length===1&&warning.querySelector('[data-ok]').textContent==='已了解'
+    warning.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})); const blocked=__top()===warning&&writes===0&&form.inert
+    warning.querySelector('[data-ok]').click(); await __until(()=>__top()===form&&!form.inert)
+    form.querySelector('#oinsecure').click(); const offQuiet=__top()===form&&!form.querySelector('#oinsecure').checked
+    form.querySelector('#oinsecure').click(); const again=await __until(()=>__top()!==form&&__top(),1000)
+    const repeated=!!again; if(again)again.querySelector('[data-ok]').click(); await __until(()=>__top()===form&&!form.inert)
+    form.querySelector('[data-ok]').click(); await __until(()=>OWN&&Object.keys(OWN.own).length===before+1)
+    const key=Object.keys(OWN.own).find(k=>OWN.own[k].name==='TLS-risk-demo'), saved=key&&OWN.own[key].insecure===true
+    const noDuplicate=!__top()
+    window.fetch=realFetch; delOwn(key); await __until(__top); await __ok(); await __until(()=>OWN&&!OWN.own[key])
+    return {'只有已了解一个按钮':one,'内容明确说明中间人攻击':/中间人攻击/.test(text),'Esc不跳过且确认前不写入':blocked,'确认后才保存显式跳过校验':saved,'取消勾选不打扰':offQuiet,'再次勾选仍提醒':repeated,'保存不重复弹已确认的提醒':noDuplicate}`)
+  await step('证书风险：JSON 批量只提示一次且保留输入', `const pending=ownJSONDialog(); await __until(__top); const form=__top(),input=form.querySelector('#ownjsontext')
+    input.value='"outbounds":'+JSON.stringify([{tag:'Risk-A',type:'anytls',server:'a.example',server_port:443,password:'fictional',tls:{enabled:true,insecure:true,fragment:true,record_fragment:true}},{tag:'Risk-B',type:'hysteria2',server:'b.example',server_ports:['35000:39000'],hop_interval:'30s',password:'fictional',tls:{enabled:true,insecure:true,fragment:true,record_fragment:true}},{type:'direct',tag:'direct'}])+',';form.querySelector('#ownjsonparse').click()
+    const text=input.value,realFetch=window.fetch;let posts=0
+    window.fetch=async(url,opts)=>{if(url==='/api/own'&&opts&&opts.method==='POST'){posts++;return new Response(JSON.stringify({ok:true}))}return realFetch(url,opts)}
+    form.querySelector('[data-ok]').click();const warning=await __until(()=>__top()!==form&&__top(),1000)
+    if(!warning){window.fetch=realFetch;await __close();return {'JSON带跳过校验也提醒':false}}
+    const unchanged=input.value===text&&posts===0
+    warning.querySelector('[data-ok]').click();const result=await pending;window.fetch=realFetch
+    return {'输入保持原样且确认前不写入':unchanged,'整批只需一次确认并一次保存':posts===1&&result.count===2}`)
+  await step('配置自适应：13个协议格式示例均可直接解析', `const pending=ownJSONDialog();await __until(__top);const form=__top(),examples=[...form.querySelectorAll('#ownjsonexamples pre')]
+    const results=examples.map(e=>parseOwnJSON(e.textContent));const labels=form.querySelector('#ownjsonexamples').textContent
+    const result={'示例不是含糊的本站节点':!labels.includes('本站节点'),'13个真实组合齐全':examples.length===13,
+      '每个示例都能识别为一个节点':results.every(r=>r.ok&&r.nodes.length===1)}
+    form.querySelector('[data-x]').click();await pending;return result`)
+  await step('分享：保留专用参数仍可明确确认复制基础链接', `const key='copy-options-demo', advanced={name:'Copy-options',type:'anytls',s:'copy.example',p:443,u:'fictional',security:'tls',insecure:false,clientOptions:{singbox:{tls:{fragment:true,record_fragment:true}}}}
+    const response=await (await fetch('/api/own',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({own:{...OWN.own,[key]:advanced}})})).json()
+    if(!response.ok)return false;OWN=null;await dash(true);await __until(()=>OWN&&OWN.own[key])
+    const button=document.querySelector('.uplist.own [onclick*="'+key+'"][aria-label="复制分享链接"]'), originalCopy=copyText, copied=[]
+    copyText=async text=>{copied.push(text);return true}
+    copyOwnLink(key,button);const warning=await __until(__top,1000)
+    if(!warning){copyText=originalCopy;delOwn(key);await __until(__top);await __ok();return {'无需删除参数可进入复制确认':false}}
+    const explicit=/专用参数/.test(warning.textContent)&&/基础/.test(warning.textContent)&&copied.length===0
+    warning.querySelector('[data-x]').click();await __until(()=>!__top());const cancelled=copied.length===0
+    copyOwnLink(key,button);await __until(__top);await __ok();await __until(()=>copied.length===1)
+    copyText=originalCopy;const read=await(await fetch('/api/own')).json(), kept=JSON.stringify(read.own[key].clientOptions)===JSON.stringify(advanced.clientOptions)
+    const basic=copied.length===1&&copied[0].startsWith('anytls://')
+    delOwn(key);await __until(__top);await __ok();await __until(()=>OWN&&!OWN.own[key])
+    return {'复制前说明基础链接不含专用参数':explicit,'取消不会复制':cancelled,'确认后可复制有效基础URI':basic,'原节点专用参数未被删除':kept}`)
+  await step('分享ECH：JSON与链接导入路径输出一致', `const ech='ech.example+https://dns.example/dns-query?value=a%2Bb&mode=full',uuid='11111111-2222-3333-4444-555555555555'
+    const own={name:'ECH-json-proxy',type:'vless',s:'safe.example',p:443,u:uuid,security:'tls',net:'ws',path:'/',flow:'',encryption:'none',insecure:false}
+    const options={xray:{tlsSettings:{echConfigList:ech,echForceQuery:'full'},finalmask:{tcp:[{type:'fragment',settings:{packets:'tlshello'}}]}}}
+    const proxy={...own,clientOptions:options},jp={...own,name:'ECH-uri-jp',importExtras:{query:[['ech',ech]]}}
+    const result=await(await fetch('/api/own',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({own:{...OWN.own,echproxy:proxy,echjp:jp}})})).json()
+    if(!result.ok)return false;OWN=null;await dash(true);await __until(()=>OWN&&OWN.own.echproxy)
+    const originalCopy=copyText,copied=[];copyText=async text=>{copied.push(text);return true}
+    const button=document.querySelector('.uplist.own [onclick*="echproxy"][aria-label="复制分享链接"]')
+    copyOwnLink('echproxy',button);const warning=await __until(__top);const notice=/ECH.*ech/.test(warning.textContent)&&/finalmask/.test(warning.textContent)
+    warning.querySelector('[data-ok]').click();await __until(()=>copied.length===1);copyText=originalCopy
+    const a=new URL(copied[0]),b=new URL(OWN.links.echjp),kept=JSON.stringify(OWN.own.echproxy.clientOptions)===JSON.stringify(options)
+    for(const key of ['echproxy','echjp']){delOwn(key);await __until(__top);await __ok();await __until(()=>OWN&&!OWN.own[key])}
+    return {'提示明确说明ECH保留其他专用项可能省略':notice,'两种导入路径分享含同值ech':a.searchParams.get('ech')===ech&&b.searchParams.get('ech')===ech,
+      '特殊字符没有二次编码或解码':a.searchParams.get('ech')===ech,'原配置仍完整保留':kept}`)
+  await step('兼容输出：明确确认后下发基础节点且原参数不丢失', `const key='compat-mode-demo',options={xray:{tlsSettings:{echConfigList:'ech.example+https://dns.example/dns-query',echForceQuery:'full'},finalmask:{tcp:[{type:'fragment',settings:{packets:'tlshello',length:'100-200',delay:'10-20'}}]}}}
+    const own={name:'Compat-mode-demo',type:'vless',s:'safe.example',p:443,u:'11111111-2222-3333-4444-555555555555',security:'tls',net:'ws',path:'/',flow:'',encryption:'none',insecure:false,clientOptions:options}
+    await fetch('/api/own',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({own:{...OWN.own,[key]:own}})});OWN=null;await dash(true);await __until(()=>OWN&&OWN.own[key])
+    const lines=[...document.querySelectorAll('#owncard .compat-warning')].filter(e=>e.textContent.includes(own.name))
+    editOwn(key);await __until(__top);const form=__top(),toggle=form.querySelector('#obasic')
+    if(!toggle){await __close();delOwn(key);await __until(__top);await __ok();return {'编辑器提供基础兼容输出开关':false}}
+    toggle.click();const warning=await __until(()=>__top()!==form&&__top(),1000)
+    if(!warning){await __close();return {'开启前必须明确确认':false}}
+    const explained=/ECH/.test(warning.textContent)&&/隐私/.test(warning.textContent)&&!toggle.checked
+    warning.querySelector('[data-x]').click();await __until(()=>__top()===form&&!form.inert);const cancelled=!toggle.checked
+    toggle.click();await __until(()=>__top()!==form);__top().querySelector('[data-ok]').click();await __until(()=>__top()===form&&toggle.checked&&!form.inert)
+    await __ok();await __until(()=>OWN&&OWN.own[key]&&OWN.own[key].compatibilityMode==='basic')
+    const kept=JSON.stringify(OWN.own[key].clientOptions)===JSON.stringify(options)
+    const preview=await(await fetch('/api/preview?pf=main&fmt=share')).json()
+    const present=preview.ok&&atob(preview.body).includes(encodeURIComponent(own.name))
+    const notices=(preview.warnings||[]).some(w=>w.name===own.name&&/基础兼容/.test(w.reason))
+    editOwn(key);await __until(__top);const edit=__top();edit.querySelector('#obasic').click();const quiet=__top()===edit;await __ok();await __until(()=>OWN&&OWN.own[key]&&OWN.own[key].compatibilityMode==='strict')
+    const strict=await(await fetch('/api/preview?pf=main&fmt=share')).json();const blocked=!atob(strict.body).includes(encodeURIComponent(own.name))
+    delOwn(key);await __until(__top);await __ok();await __until(()=>OWN&&!OWN.own[key])
+    return {'重复格式提示按实际省略内容合并':lines.length===2&&lines.some(e=>e.textContent.includes(' / ')),'明确说明省略参数与隐私影响':explained,'取消不启用':cancelled,
+      '启用后订阅含基础节点并保留参数':present&&kept,'预览说明实际省略':notices,'关闭立即回到完整参数模式':quiet&&blocked}`)
+  await step('兼容输出：JSON声明basic也不能跳过明确确认', `const pending=ownJSONDialog();await __until(__top);const form=__top(),input=form.querySelector('#ownjsontext')
+    input.value=JSON.stringify({name:'JSON-basic-consent',type:'vless',s:'safe.example',p:443,u:'11111111-2222-3333-4444-555555555555',security:'tls',net:'ws',path:'/',flow:'',encryption:'none',insecure:false,compatibilityMode:'basic',clientOptions:{xray:{finalmask:{tcp:[{type:'fragment',settings:{packets:'tlshello'}}]}}}})
+    form.querySelector('#ownjsonparse').click();const original=window.fetch;let posts=0
+    window.fetch=async(url,opts)=>{if(url==='/api/own'&&opts&&opts.method==='POST'){posts++;return new Response(JSON.stringify({ok:true}))}return original(url,opts)}
+    form.querySelector('[data-ok]').click();const warning=await __until(()=>__top()!==form&&__top())
+    const before=posts===0&&form.inert&&/所有订阅/.test(warning.textContent)
+    warning.querySelector('[data-x]').click();await __until(()=>__top()===form&&form.querySelector('.ferr'));const kept=input.value.includes('JSON-basic-consent')&&posts===0
+    form.querySelector('[data-ok]').click();await __until(()=>__top()!==form);__top().querySelector('[data-ok]').click();const result=await pending;window.fetch=original
+    return {'确认前没有保存请求':before,'取消保留输入且不写入':kept,'重新确认后只保存一次':posts===1&&result.count===1}`)
+  await step('配置自适应：Clash单行与Xray专用字段保留', `const uuid='11111111-2222-3333-4444-555555555555'
+    const line='- { name: Test, type: vless, server: safe.example, port: 443, uuid: '+uuid+', alterId: 0, cipher: auto, udp: true, flow: null, encryption: none, tls: true, skip-cert-verify: false, servername: tls.example, client-fingerprint: safari, network: ws, ws-opts: { path: /, headers: { Host: tls.example } } }'
+    const clash=parseOwnJSON(line), multiple=parseOwnJSON('    '+line+'\\n    '+line.replace('Test','Second')), clipped=parseOwnJSON(line+'\\n    '+line.replace('Test','Clipped'))
+    const xray=parseOwnJSON('"outbounds":'+JSON.stringify([{tag:'proxy',protocol:'vless',settings:{address:'safe.example',port:443,id:uuid,encryption:'none',email:''},streamSettings:{network:'ws',security:'tls',tlsSettings:{serverName:'tls.example',fingerprint:'chrome',echConfigList:'ech.example+https://dns.example/dns-query',echForceQuery:'full'},wsSettings:{path:'/',host:'tls.example',headers:{'User-Agent':'safari'}},finalmask:{tcp:[{type:'fragment',settings:{header:null,value:null,password:null,url:null,stunServers:null,packetSize:null,packets:'tlshello',length:'100-200',delay:'10-20',lengths:['100-200'],delays:['10-20'],maxSplit:0,reset:null,noise:null}}]}},mux:{enabled:false,concurrency:-1}},{protocol:'freedom',tag:'direct'},{protocol:'blackhole',tag:'block'}])+',')
+    return {'单行YAML和空Flow被正确识别':clash.ok&&clash.nodes[0].net==='ws'&&clash.nodes[0].flow==='',
+      '多行公共缩进和首行缺失缩进均识别':multiple.ok&&multiple.nodes.length===2&&clipped.ok&&clipped.nodes.length===2,
+      'Xray片段无需外壳且跳过非代理出站':xray.ok&&xray.nodes.length===1,
+      'ECH和finalmask没有被删除':xray.ok&&xray.nodes[0].clientOptions.xray.tlsSettings.echForceQuery==='full'&&xray.nodes[0].clientOptions.xray.finalmask.tcp[0].settings.header===null}`)
   await step('自有节点：WebSocket 传输切换表单字段并能保存', `editOwn(null); await __until(__top); const m = __top()
     m.querySelector('#osecurity .selb').click(); await __w(50); document.querySelector('.selp.portal .selo[data-v="tls"]').click(); await __w(50)
     m.querySelector('#onet .selb').click(); await __w(50); document.querySelector('.selp.portal .selo[data-v="ws"]').click(); await __w(50)
@@ -318,8 +529,13 @@ try {
       if (!warning) return false
       await __until(() => warning.contains(document.activeElement) && !document.querySelector('.bd.out'))
       const r = warning.getBoundingClientRect(), ct = warning.querySelector('.ct')
+      const first = warning.querySelector('.bdy > :first-child'), body = warning.querySelector('.bdy')
+      const compact = first.getBoundingClientRect().top - ct.getBoundingClientRect().top
       return { '弹窗在视口内': r.left >= 0 && r.right <= innerWidth + 1 && r.top >= 0 && r.bottom <= innerHeight + 1,
         '正文不横向溢出': ct.scrollWidth <= ct.clientWidth + 1,
+        '正文开头没有叠加大块空白': compact >= 0 && compact <= 12,
+        '段落间距不重复叠加': getComputedStyle(body).gap === '14px' && getComputedStyle(body.querySelector('p')).marginTop === '0px',
+        '拉取方式显示简版完整链路': warning.textContent.includes('当前网络请求订阅 → 内容返回浏览器 → 上传 Worker → 保存到 KV'),
         '底层表单不可误操作': form.inert,
         '两层弹窗标题关联独立': warning.getAttribute('aria-labelledby') !== form.getAttribute('aria-labelledby') }`)
     if (process.env.E2E_SCREENSHOT_DIR) {
@@ -345,6 +561,47 @@ try {
     await step(name + ' 空格切换偏好', `const input = __top().querySelector('#ualrisk')
       const saved = input.checked && localStorage.getItem('cfsub-local-risk-v1') === '1'
       input.click(); await __close(); return saved && localStorage.getItem('cfsub-local-risk-v1') === null`)
+  }
+
+  sec('JSON 菜单与弹窗：手机和桌面布局')
+  for (const [name, opt] of [['desktop-light', { w:1100, h:900 }], ['mobile-dark', { w:390, h:844, mobile:true, dark:true }]]) {
+    await page('node', opt)
+    const pos = await b.run(`document.querySelector('#ownadd').scrollIntoView({block:'center'}); const r=document.querySelector('#ownadd').getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2}`)
+    if (opt.mobile) {
+      await b.send('Emulation.setTouchEmulationEnabled', { enabled:true })
+      await b.send('Input.dispatchTouchEvent', { type:'touchStart', touchPoints:[pos] })
+      await b.send('Input.dispatchTouchEvent', { type:'touchEnd', touchPoints:[] })
+    } else {
+      await b.send('Input.dispatchMouseEvent', {type:'mouseMoved', ...pos})
+    }
+    await step(name + ' 添加菜单', `const menu=document.querySelector('#ownaddmenu'), r=menu.getBoundingClientRect()
+      return { '实际触摸或悬停展开': !menu.hidden, '菜单不超出左右边界': r.left>=0 && r.right<=innerWidth+1,
+        '菜单只有一个触发按钮': document.querySelectorAll('.own-add > button').length===1 }`)
+    if (process.env.E2E_SCREENSHOT_DIR) {
+      const shot = await b.send('Page.captureScreenshot', {format:'png'})
+      fs.writeFileSync(path.join(process.env.E2E_SCREENSHOT_DIR, name + '-add-menu.png'), Buffer.from(shot.data,'base64'))
+    }
+    await step(name + ' JSON 导入布局', `document.querySelector('#ownaddmenu button:last-child').click()
+      await __until(__top); const box=__top(), ct=box.querySelector('.ct'), r=box.getBoundingClientRect()
+      await __until(()=>!document.querySelector('.bd.out'))
+      return { '输入示例不成为表单内容': box.querySelector('#ownjsontext').value==='',
+        '弹窗和文本框没有横向溢出': r.left>=0 && r.right<=innerWidth+1 && ct.scrollWidth<=ct.clientWidth+1,
+        '三种结构说明齐全': box.querySelectorAll('#ownjsonexamples details').length===3 }`)
+    if (process.env.E2E_SCREENSHOT_DIR) {
+      const shot=await b.send('Page.captureScreenshot',{format:'png'})
+      fs.writeFileSync(path.join(process.env.E2E_SCREENSHOT_DIR,name+'-json-import.png'),Buffer.from(shot.data,'base64'))
+    }
+    await step(name+' 证书风险告知布局',`const parent=__top();window.__riskLayout=acknowledgeInsecure(parent,[{insecure:true}])
+      const warning=await __until(()=>__top()!==parent&&__top());await __until(()=>warning.contains(document.activeElement))
+      const r=warning.getBoundingClientRect();return {'告知窗口不超出视口':r.left>=0&&r.right<=innerWidth+1&&r.top>=0&&r.bottom<=innerHeight+1,
+        '只显示已了解按钮':warning.querySelectorAll('button').length===1&&warning.querySelector('button').textContent==='已了解'}`)
+    if(process.env.E2E_SCREENSHOT_DIR){
+      const shot=await b.send('Page.captureScreenshot',{format:'png'})
+      fs.writeFileSync(path.join(process.env.E2E_SCREENSHOT_DIR,name+'-insecure-warning.png'),Buffer.from(shot.data,'base64'))
+    }
+    await b.run(`__top().querySelector('[data-ok]').click();await window.__riskLayout`)
+    await b.run(`await __close()`)
+    if (opt.mobile) await b.send('Emulation.setTouchEmulationEnabled', {enabled:false})
   }
 
   sec('页面错误')

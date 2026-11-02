@@ -1719,6 +1719,166 @@ function validateImportExtras(value, type) {
   return value.query === undefined || (Array.isArray(value.query) && value.query.every(pair => Array.isArray(pair) && pair.length === 2 && pair.every(x => typeof x === 'string') && !reservedImportQuery(type,pair[0])))
 }
 
+function validateClientOptions(value, type, security) {
+  const obj = v => v && typeof v === 'object' && !Array.isArray(v)
+  const allowed = (v, keys) => obj(v) && Object.keys(v).every(k => keys.includes(k))
+  let count = 0
+  const safe = (v, depth = 0) => {
+    if (++count > 1000 || depth > 12) return false
+    if (v === null || typeof v === 'boolean') return true
+    if (typeof v === 'number') return Number.isFinite(v)
+    if (typeof v === 'string') return v.length <= 32768 && !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(v)
+    return typeof v === 'object' && Object.entries(v).every(([k, child]) => !BAD_KEYS.has(k) && k.length <= 256 && !/[\x00-\x1f\x7f]/.test(k) && safe(child, depth + 1))
+  }
+  if (!allowed(value, ['singbox','xray']) || !safe(value) || JSON.stringify(value).length > 32768) return false
+  if (Object.keys(value).length && type === 'ss') return false
+  if (value.singbox !== undefined) {
+    if (security === 'none') return false
+    if (!allowed(value.singbox, ['tls']) || !allowed(value.singbox.tls, ['fragment','record_fragment','fragment_fallback_delay']) || !Object.keys(value.singbox.tls).length) return false
+    const tls = value.singbox.tls
+    for (const key of ['fragment','record_fragment']) if (tls[key] !== undefined && typeof tls[key] !== 'boolean') return false
+    if (tls.fragment_fallback_delay !== undefined) {
+      if (typeof tls.fragment_fallback_delay !== 'string') return false
+      const m = tls.fragment_fallback_delay.match(/^(\d+(?:\.\d+)?)(ns|us|ms|s|m|h)$/)
+      if (!m) return false
+      const seconds = Number(m[1]) * ({ns:1e-9,us:1e-6,ms:0.001,s:1,m:60,h:3600})[m[2]]
+      if (!Number.isFinite(seconds) || seconds > 86400) return false
+    }
+  }
+  if (value.xray !== undefined) {
+    const x = value.xray
+    if (!['vless','vmess'].includes(type) || !allowed(x, ['tlsSettings','finalmask']) || !Object.keys(x).length) return false
+    if (x.tlsSettings !== undefined) {
+      if (security === 'none') return false
+      if (!allowed(x.tlsSettings, ['echConfigList','echForceQuery']) || !Object.keys(x.tlsSettings).length) return false
+      for (const val of Object.values(x.tlsSettings)) if (typeof val !== 'string' || /[\x00-\x1f\x7f]/.test(val)) return false
+    }
+    if (x.finalmask !== undefined && (!allowed(x.finalmask, ['tcp','udp']) || Object.values(x.finalmask).some(v => !Array.isArray(v)))) return false
+  }
+  return true
+}
+
+function compactClientOptions(value) {
+  const options = JSON.parse(JSON.stringify(value || {}))
+  if (options.singbox && options.singbox.tls) {
+    const tls = options.singbox.tls
+    for (const key of ['fragment','record_fragment']) if (tls[key] === false) delete tls[key]
+    if (!tls.fragment) delete tls.fragment_fallback_delay
+    if (!Object.keys(tls).length) delete options.singbox
+  }
+  if (options.xray) {
+    const x = options.xray
+    if (x.tlsSettings) {
+      for (const key of Object.keys(x.tlsSettings)) if (x.tlsSettings[key] === '') delete x.tlsSettings[key]
+      if (!Object.keys(x.tlsSettings).length) delete x.tlsSettings
+    }
+    if (x.finalmask) {
+      for (const key of Object.keys(x.finalmask)) if (Array.isArray(x.finalmask[key]) && !x.finalmask[key].length) delete x.finalmask[key]
+      if (!Object.keys(x.finalmask).length) delete x.finalmask
+    }
+    if (!Object.keys(x).length) delete options.xray
+  }
+  return options
+}
+
+function echForFormat(n, format) {
+  const tls = n?.clientOptions?.xray?.tlsSettings
+  if (tls === undefined) return { supported: true }
+  const unsupported = reason => ({ supported: false, reason })
+  if (!tls || typeof tls !== 'object' || Array.isArray(tls)
+    || Object.keys(tls).some(k => !['echConfigList', 'echForceQuery'].includes(k)))
+    return unsupported('Unsupported Xray ECH settings structure')
+  if (tls.echForceQuery !== undefined && tls.echForceQuery !== '')
+    return unsupported('Xray echForceQuery has no verified equivalent in this output format')
+  const config = tls.echConfigList
+  if (config === undefined || config === '') return { supported: true }
+  if (typeof config !== 'string' || config.length > 32768)
+    return unsupported('Invalid or oversized ECHConfigList')
+  // Mapping only the query name would silently replace Xray's chosen resolver.
+  if (config.includes('://'))
+    return unsupported('Resolver-backed Xray ECH cannot preserve its DNS resolver in this output format')
+  if (config.length % 4 || !/^[A-Za-z0-9+/]+={0,2}$/.test(config))
+    return unsupported('Invalid ECHConfigList base64 encoding')
+  let raw
+  try { raw = atob(config) } catch { return unsupported('Invalid ECHConfigList base64 encoding') }
+  if (btoa(raw) !== config) return unsupported('Invalid ECHConfigList base64 encoding')
+
+  // Validate wire framing, not key authenticity or the remote server's support.
+  const u16 = p => (raw.charCodeAt(p) << 8) | raw.charCodeAt(p + 1)
+  const invalid = () => unsupported('Invalid or unsupported ECHConfigList record structure')
+  if (raw.length < 6 || u16(0) !== raw.length - 2) return invalid()
+  let p = 2
+  while (p < raw.length) {
+    if (p + 4 > raw.length || u16(p) !== 0xfe0d) return invalid()
+    const end = p + 4 + u16(p + 2)
+    p += 4
+    if (end > raw.length || p + 5 > end) return invalid()
+    const keyLength = u16(p + 3)
+    p += 5
+    if (!keyLength || p + keyLength + 2 > end) return invalid()
+    p += keyLength
+    const suiteLength = u16(p)
+    p += 2
+    if (suiteLength < 4 || suiteLength % 4 || p + suiteLength + 2 > end) return invalid()
+    p += suiteLength + 1
+    const nameLength = raw.charCodeAt(p++)
+    if (!nameLength || p + nameLength + 2 > end) return invalid()
+    const publicName = raw.slice(p, p + nameLength)
+    if (publicName.length > 253 || publicName.split('.').some(label => !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label)))
+      return invalid()
+    p += nameLength
+    const extensionLength = u16(p)
+    p += 2
+    if (p + extensionLength !== end) return invalid()
+    while (p < end) {
+      if (p + 4 > end) return invalid()
+      const length = u16(p + 2)
+      p += 4 + length
+      if (p > end) return invalid()
+    }
+  }
+
+  if (format === 'clash') return { supported: true, clash: { 'ech-opts': { enable: true, config } } }
+  if (format === 'singbox') return { supported: true, singbox: { ech: {
+    enabled: true,
+    config: ['-----BEGIN ECH CONFIGS-----', ...config.match(/.{1,64}/g), '-----END ECH CONFIGS-----'],
+  } } }
+  return unsupported('ECH has no verified equivalent in this output format')
+}
+
+function ownShareECH(n) {
+  if (n.type !== 'vless') return { present:false }
+  const values = []
+  const config = n.clientOptions?.xray?.tlsSettings?.echConfigList
+  if (ownSecurity(n) === 'tls' && typeof config === 'string' && config !== '') values.push(config)
+  for (const [key, value] of n.importExtras?.query || []) if (key.toLowerCase() === 'ech') values.push(value)
+  if (!values.length) return { present:false }
+  if (values.some(value => value !== values[0])) return { present:false, conflict:true }
+  return { present:true, value:values[0] }
+}
+
+function unsupportedClientFields(n, format) {
+  const missing = []
+  const options = n.clientOptions || {}, xray = options.xray
+  if (xray) {
+    if (Object.keys(xray).some(k => !['tlsSettings','finalmask'].includes(k))) missing.push('Xray 专用选项')
+    if (Object.values(xray.tlsSettings || {}).some(v => v !== '')) {
+      const shared = format === 'share' ? ownShareECH(n) : null
+      if (shared && shared.present && !shared.conflict) {
+        if (xray.tlsSettings.echForceQuery) missing.push('ECH 查询策略（echForceQuery）')
+      } else if (!echForFormat(n, format).supported) missing.push('ECH')
+    }
+    if (Object.values(xray.finalmask || {}).some(v => !Array.isArray(v) || v.length)) missing.push('finalmask')
+  }
+  const tls = options.singbox && options.singbox.tls
+  if (format !== 'singbox' && tls && (tls.fragment || tls.record_fragment)) missing.push('TLS 分片')
+  return missing
+}
+
+function clientOptionsUnsupported(n, format) {
+  return n.compatibilityMode !== 'basic' && unsupportedClientFields(n, format).length > 0
+}
+
 function normalizeOwnNode(v) {
   const bad = (err, field) => ({ err, field })
   if (!v || typeof v !== 'object' || Array.isArray(v)) return bad('节点数据格式错误')
@@ -1750,6 +1910,19 @@ function normalizeOwnNode(v) {
     n.security = v.security
   }
   const sec = ownSecurity({ ...n, net: v.net })
+  if (v.realityPQ !== undefined) {
+    if (typeof v.realityPQ !== 'boolean' || n.type !== 'vless' || sec !== 'reality') return bad('Reality 后量子能力开关必须为布尔值，且仅适用于 VLESS Reality', 'realityPQ')
+    n.realityPQ = v.realityPQ
+  }
+  if (v.compatibilityMode !== undefined) {
+    if (!['strict','basic'].includes(v.compatibilityMode)) return bad('兼容输出方式只能是 strict 或 basic', 'compatibilityMode')
+    n.compatibilityMode = v.compatibilityMode
+  }
+  if (v.clientOptions !== undefined) {
+    if (!validateClientOptions(v.clientOptions, n.type, sec)) return bad('客户端专用参数格式不正确、超限或不适用于当前协议 / TLS；不能覆盖主配置字段', 'clientOptions')
+    const options = compactClientOptions(v.clientOptions)
+    if (Object.keys(options).length) n.clientOptions = options
+  }
   if (['hysteria2', 'anytls'].includes(n.type) && sec !== 'tls') return bad('该协议必须使用 TLS', 'security')
   if (sec === 'reality' && n.type !== 'vless') return bad('仅 VLESS 支持这里的 Reality 配置', 'security')
   for (const key of ['udp', 'insecure', 'uot']) if (v[key] !== undefined) {
@@ -1912,7 +2085,13 @@ function ownToKv(n) {
     if (n.certSha256) kv.fingerprint = yq(n.certSha256)
     if (n.alpn && n.alpn.length) kv.alpn = yqList(n.alpn)
     kv['skip-cert-verify'] = String(n.insecure === undefined ? legacy && n.type === 'hysteria2' : n.insecure)
-    if (sec === 'reality') kv['reality-opts'] = JSON.stringify({ 'public-key': n.pk || '', 'short-id': n.sid || '' })
+    if (sec === 'reality') {
+      const reality = { 'public-key': n.pk || '', 'short-id': n.sid || '' }
+      if (n.realityPQ !== undefined) reality['support-x25519mlkem768'] = n.realityPQ
+      kv['reality-opts'] = JSON.stringify(reality)
+    }
+    const ech = echForFormat(n, 'clash')
+    if (ech.supported && ech.clash) for (const [key, value] of Object.entries(ech.clash)) kv[key] = JSON.stringify(value)
   }
   return kv
 }
@@ -1924,6 +2103,15 @@ function ownSRUnsafeField(n) {
 function ownCompatibility(n) {
   const out = [], add = (format, field, reason) => out.push({ format, field, reason })
   const net = n.net || 'tcp'
+  if (n.realityPQ !== undefined) for (const format of ['singbox','shadowrocket','share']) add(format, 'realityPQ', n.realityPQ
+    ? '已保留标准 Reality 参数；Mihomo 的 X25519MLKEM768 允许开关未直接映射，密钥交换由目标客户端内核与指纹协商，不保证跨版本等效。'
+    : '已保留标准 Reality 参数；此格式不能强制执行 Mihomo 的禁用 X25519MLKEM768 开关，密钥交换由客户端协商，请特别核对旧服务端兼容性。')
+  for (const format of ['clash','singbox','shadowrocket','share']) {
+    const missing = unsupportedClientFields(n, format)
+    if (missing.length) add(format, 'clientOptions', n.compatibilityMode === 'basic'
+      ? '基础兼容输出：省略无法表达的 ' + missing.join('、') + '，原参数仍保留。连接效果或隐私保护可能不同。'
+      : '此格式无法完整表达 ' + missing.join('、') + '，节点暂不下发；可在编辑节点中确认启用“基础兼容输出”，原参数会保留。')
+  }
   if (n.importExtras) {
     const keys = [...Object.keys(n.importExtras.vmess || {}), ...(n.importExtras.query || []).map(([key]) => key), ...Object.keys(n.importExtras.plugin || {})]
     if (keys.length) for (const format of ['clash','singbox','shadowrocket']) add(format, 'importExtras', '导入扩展字段已保留，但当前完整配置尚未应用：' + [...new Set(keys)].join(', '))
@@ -3129,9 +3317,17 @@ async function apiRoute(req, url, event) {
     }
     // 顺带给每个节点一条分享链接：单独导入某个自建节点时不必去服务器上翻配置
     const own = await loadOwn()
-    const links = {}
-    for (const [k, n] of Object.entries(own)) { try { links[k] = shareLink({ name: n.name, own: true, o: n }) || '' } catch (e) {} }
-    return json({ ok: true, own, links, compatibility: Object.fromEntries(Object.entries(own).map(([k, n]) => [k, ownCompatibility(n)])) })
+    const links = {}, basicLinks = {}, linkErrors = {}
+    for (const [k, n] of Object.entries(own)) {
+      try {
+        links[k] = shareLink({ name: n.name, own: true, o: n }) || ''
+        if (!links[k] && n.clientOptions) basicLinks[k] = shareLink({ name: n.name, own: true, o: n }, true) || ''
+      } catch (e) {
+        links[k] = ''; basicLinks[k] = ''
+        linkErrors[k] = ownShareECH(n).conflict ? 'ECH 分享参数存在冲突，请核对节点 JSON 中的 echConfigList 与导入扩展字段。' : '节点分享链接编码失败，请检查节点配置中的特殊字符。'
+      }
+    }
+    return json({ ok: true, own, links, basicLinks, linkErrors, compatibility: Object.fromEntries(Object.entries(own).map(([k, n]) => [k, ownCompatibility(n)])) })
   }
   // 订阅预览：某份订阅在某种客户端格式下的完整内容。
   // 走的是订阅端点同一个 renderSub，这里看到的就是客户端拿到的。
@@ -3365,6 +3561,7 @@ function requoteFlow(t) {
 }
 
 function genClash(blacklist, up, policies, lib, own, st, chains, pool) {
+  own = Object.fromEntries(Object.entries(own || {}).filter(([, n]) => !clientOptionsUnsupported(n, 'clash')))
   const SET = { ...DEFAULT_SETTINGS, ...(st || {}) }
   const D = { ...DEFAULT_DNS, ...(SET.dns || {}) }
   const Y = JSON.stringify
@@ -3842,7 +4039,11 @@ function toSB(n) {
 // 自有节点 → sing-box outbound；转不出的返回 null（调用方连同分组引用一起剔除）
 function ownToSB(n) {
   if (!n || !OWN_TYPES.includes(n.type)) return null
+  if (clientOptionsUnsupported(n, 'singbox')) return null
   const outbound = toSB({ name: n.name, kv: ownToKv(n) })
+  if (outbound && outbound.tls && n.clientOptions && n.clientOptions.singbox) Object.assign(outbound.tls, n.clientOptions.singbox.tls)
+  const ech = echForFormat(n, 'singbox')
+  if (outbound && outbound.tls && ech.supported && ech.singbox) Object.assign(outbound.tls, ech.singbox)
   if (outbound && n.udp === false) outbound.network = 'tcp'
   return outbound
 }
@@ -4048,6 +4249,7 @@ function srWsParams(net, ws) {
 
 function ownToSR(n) {
   if (!n || !OWN_TYPES.includes(n.type)) return null
+  if (clientOptionsUnsupported(n, 'shadowrocket')) return null
   if (n.certSha256 || n.verifyName) return null
   if (ownSRUnsafeField(n)) return null
   if (n.type === 'vless' && n.encryption && n.encryption !== 'none') return null
@@ -4275,12 +4477,15 @@ function hostPart(h) {
   return (h.includes(':') && !h.startsWith('[')) ? `[${h}]` : h
 }
 
-function shareLink(n) {
+function shareLink(n, allowOmittedClientOptions = false) {
   const tag = encodeURIComponent(n.name)
   if (n.own) {
+    const sharedECH = ownShareECH(n.o)
+    if (sharedECH.conflict) throw new Error('ECH 分享参数存在冲突，请核对节点配置。')
+    if (allowOmittedClientOptions !== true && clientOptionsUnsupported(n.o, 'share')) return ''
     const link = shareLink({ name: n.name, kv: ownToKv(n.o) })
-    const extras = n.o.importExtras
-    if (!link || !extras) return link
+    const extras = n.o.importExtras || {}
+    if (!link || (!n.o.importExtras && !sharedECH.present)) return link
     if (n.o.type === 'vmess') {
       const current = JSON.parse(b64decode(link.slice(8)))
       const query = Object.create(null)
@@ -4293,13 +4498,16 @@ function shareLink(n) {
       return 'vmess://' + b64utf8(JSON.stringify({ ...additional, ...query, ...current }))
     }
     const url = new URL(link)
+    if (sharedECH.present) url.searchParams.set('ech', sharedECH.value)
     const generated = new Set(url.searchParams.keys())
-    for (const [key, value] of extras.query || []) if (!generated.has(key) && !BAD_KEYS.has(key) && !reservedImportQuery(n.o.type,key)) url.searchParams.append(key, value)
+    for (const [key, value] of extras.query || []) if (!(sharedECH.present && key.toLowerCase() === 'ech') && !generated.has(key) && !BAD_KEYS.has(key) && !reservedImportQuery(n.o.type,key)) url.searchParams.append(key, value)
     if (n.o.type === 'ss' && extras.plugin && Object.keys(extras.plugin).length) {
       const esc = s => String(s).replace(/[\\;=]/g, '\\$&')
       const tail = Object.entries(extras.plugin).filter(([key]) => !BAD_KEYS.has(key) && !IMPORT_PLUGIN_FIELDS.has(key)).map(([key, value]) => esc(key) + (value === '' ? '' : '=' + esc(value))).join(';')
       if (url.searchParams.has('plugin')) url.searchParams.set('plugin', url.searchParams.get('plugin') + ';' + tail)
     }
+    // v2rayN percent-decodes ECH without interpreting '+' as a space.
+    if (sharedECH.present) url.search = '?' + url.search.slice(1).split('&').map(part => part.startsWith('ech=') ? 'ech=' + encodeURIComponent(sharedECH.value) : part).join('&')
     return url.href
   }
   // 上游节点：这里是 parseShareLine 的逆运算，两边字段映射必须对得上，
@@ -4410,7 +4618,7 @@ function shareLink(n) {
 function genShare(up, ownCfg, st) {
   const SET = { ...DEFAULT_SETTINGS, ...(st || {}) }
   const own = Object.values(ownCfg || {}).map(o => ({ name: o.name, own: true, o: { ...o, s: o.s } }))
-  const links = [...own, ...up].map(shareLink).filter(Boolean)
+  const links = [...own, ...up].map(n => shareLink(n)).filter(Boolean)
   return b64utf8(links.join('\n'))
 }
 
@@ -4509,7 +4717,7 @@ function installOwnEditor() {
     }
     const input = (id, label, value = '', extra = '') => `<div class="fg"><label class="lb" for="${id}">${label}</label><input id="${id}" class="mono" value="${esc(String(value ?? ''))}" autocomplete="off" spellcheck="false" ${extra}></div>`
     const select = (id, label, options, value) => `<div class="fg"><label class="lb">${label}</label>${selectHTML(id, options, value)}</div>`
-    const toggle = (id, label, checked) => `<label class="own-check" for="${id}"><input id="${id}" type="checkbox" ${checked ? 'checked' : ''}><span class="own-check-box" aria-hidden="true"></span><span>${label}</span></label>`
+    const toggle = (id, label, checked) => `<label class="own-check"><input id="${id}" type="checkbox" ${checked ? 'checked' : ''}><span class="own-check-box" aria-hidden="true"></span><span>${label}</span></label>`
     const numeric = 'type="number" min="0" step="1"'
     const html = `
       ${isNew ? `<div class="fg"><label class="lb" for="oimp">从分享链接导入<span class="opt">可选</span></label><div class="row"><input id="oimp" class="mono" placeholder="vless://、hy2://、ss://、vmess://、anytls://" autocomplete="off"><button type="button" class="g" id="oimpb">解析填充</button></div></div><hr class="fsep">` : ''}
@@ -4521,7 +4729,7 @@ function installOwnEditor() {
       <div id="fsecurity">${select('osecurity', '连接安全', [{v:'reality',label:'Reality'},{v:'tls',label:'TLS'},{v:'none',label:'不加密（仅可信内网 / VLESS Encryption）'}], n.security)}</div>
       <div id="ftls">${input('osni', 'SNI / TLS 服务器名称', n.sni)}</div>
       <div id="ftransport">${select('onet', '传输方式', networks, n.net)}
-        <div id="fr"><div class="own-fields">${input('opk', 'Reality 公钥', n.pk)}${input('osid', 'ShortId', n.sid)}</div></div>
+        <div id="fr"><div class="own-fields">${input('opk', 'Reality 公钥', n.pk)}${input('osid', 'ShortId', n.sid)}</div>${select('orealitypq', 'Reality 密钥交换能力（Mihomo）', [{v:'',label:'保持客户端默认'},{v:'1',label:'允许指纹提供 X25519MLKEM768'},{v:'0',label:'移除 X25519MLKEM768（兼容旧服务端）'}], n.realityPQ === undefined ? '' : n.realityPQ ? '1' : '0')}<div class="hint">这是 Mihomo 的指纹能力开关，不是强制启用后量子。Xray 等内核通常自行协商；分享保留公钥、ShortId、SNI 和指纹，请核对客户端内核版本。</div></div>
         <div id="fw"><div class="own-fields">${input('opath', '传输路径', n.path || '/')}${input('ohost', 'Host（留空使用 SNI）', n.host)}</div></div>
         <div id="fgrpc">${input('ogrpc', 'gRPC ServiceName', n.serviceName)}</div>
         <div id="fxmode">${select('omode', 'XHTTP 模式', ['auto','packet-up','stream-up','stream-one'].map(v => ({v,label:v})), n.mode || 'auto')}</div>
@@ -4538,25 +4746,48 @@ function installOwnEditor() {
         <div id="fss">${toggle('ouot', '启用 UDP-over-TCP', n.uot)}${select('ouotversion', 'UDP-over-TCP 版本', [{v:'2',label:'2'},{v:'1',label:'1'}], String(n.uotVersion || 2))}${select('oplugin', 'SS 插件', [{v:'',label:'不使用插件'},{v:'obfs',label:'simple-obfs'},{v:'v2ray-plugin',label:'v2ray-plugin'}], n.plugin || '')}<div id="fplugin">${select('opluginmode', '插件模式', [{v:'websocket',label:'WebSocket（v2ray-plugin）'},{v:'http',label:'HTTP（obfs）'},{v:'tls',label:'TLS（obfs）'}], n.pluginOpts?.mode || (n.plugin === 'obfs' ? 'http' : 'websocket'))}${input('opluginhost', '插件 Host', n.pluginOpts?.host)}${input('opluginpath', '插件路径', n.pluginOpts?.path || '/')}${toggle('oplugintls', '插件 TLS', String(n.pluginOpts?.tls) === 'true')}${toggle('opluginmux', '插件 Mux', String(n.pluginOpts?.mux) === 'true')}</div></div>
         <div id="fanytls"><div class="own-fields">${input('oidlecheck', '空闲会话检查间隔（秒）', n.idleCheck, numeric)}${input('oidletimeout', '空闲会话超时（秒）', n.idleTimeout, numeric)}</div>${input('ominidle', '最少保留的空闲会话数量', n.minIdle, numeric)}</div>
         <div class="fg" id="fimportextras" ${n.importExtras ? '' : 'hidden'}><label class="lb" for="oimportextras">导入扩展字段（JSON，原样保留）</label><textarea id="oimportextras" spellcheck="false">${esc(JSON.stringify(n.importExtras || {}))}</textarea><div class="hint">这些字段不会导致整条链接被拒绝。当前完整配置未必支持，请核对兼容提示；分享链接会尽量原样保留。字段可能包含敏感信息，请勿截图外发。</div></div>
+        <div class="fg" id="fclientoptions" ${n.clientOptions ? '' : 'hidden'}><label class="lb" for="oclientoptions">客户端专用参数（JSON，原样保留）</label><textarea id="oclientoptions" spellcheck="false">${esc(JSON.stringify(n.clientOptions || {}))}</textarea><div class="hint">保留 ECH、分片等原参数。无法等效转换的格式默认不下发；可在下方明确确认基础兼容输出，下发可表达的基础配置。</div></div>
+        <div class="fg" id="fcompatmode" ${n.clientOptions ? '' : 'hidden'}>${toggle('obasic', '基础兼容输出（需确认）', n.compatibilityMode === 'basic')}<div class="hint">仅在无法完整转换的格式中省略专用参数，下发基础节点；原参数保留。默认关闭，可随时恢复。此选择影响包含该节点的所有订阅。</div></div>
       </details>
       ${isNew ? '' : `<div class="fg"><label class="lb">节点标识（自动生成，不可改）</label><input class="mono" value="${esc(key)}" disabled></div>`}`
     let readForm
-    const box = await modal({ title: isNew ? '添加自有节点' : '编辑自有节点', html, ok: '保存', wide: true, onMount: b => {
+    const box = await modal({ title: isNew ? '添加自有节点' : '编辑自有节点', html, ok: '保存', wide: true,
+      foot: '<button type="button" class="g sm" id="ownjson">编辑 JSON</button>', onMount: b => {
       bindSelect(b)
       b.querySelectorAll('.sel').forEach(s => s.querySelector('.selb').setAttribute('aria-label', s.closest('.fg').querySelector('label')?.textContent || s.id))
       const get = id => b.querySelector('#' + id)
       const val = id => get(id).value.trim(), pick = id => selValue(get(id))
+      b.__insecureAcknowledged = !isNew && n.insecure === true
+      const warnInsecure = async () => {
+        b.__insecureAcknowledged = false
+        if (!get('oinsecure').checked) return
+        await acknowledgeInsecure(b, [{ insecure:true }])
+        b.__insecureAcknowledged = get('oinsecure').checked
+      }
+      get('oinsecure').addEventListener('change', warnInsecure)
+      b.__basicAcknowledged = n.compatibilityMode === 'basic'
+      get('obasic').addEventListener('change', async () => {
+        b.__basicAcknowledged = false
+        if (!get('obasic').checked) return
+        get('obasic').checked = false
+        const confirmed = await confirmBasicCompatibility(b, [{ compatibilityMode:'basic' }])
+        if (confirmed && b.isConnected) { get('obasic').checked = true; b.__basicAcknowledged = true }
+      })
       const choose = (id, value) => {
         const sel = get(id), opt = [...(sel._pop || sel).querySelectorAll('.selo')].find(x => x.dataset.v === String(value))
         if (opt && pick(id) !== String(value)) opt.click()
       }
-      let active = n.type, filling = false
+      let active = n.type, filling = false, compatibilityExplicit = n.compatibilityMode !== undefined
       const drafts = { [active]: n }
       readForm = (type = pick('ot')) => {
         const d = { name: val('on'), type, s: val('os'), p: val('op'), u: get('ou').value, sni: type === 'ss' ? '' : val('osni'), security: type === 'ss' ? 'none' : ['anytls','hysteria2'].includes(type) ? 'tls' : pick('osecurity'), udp: get('oudp').checked }
+        if (compatibilityExplicit || get('obasic').checked) d.compatibilityMode = get('obasic').checked ? 'basic' : 'strict'
         const readJSON = id => { try { return JSON.parse(get(id).value || '{}') } catch (e) { e.field = id; throw e } }
         const extra = readJSON('oimportextras')
         if (Object.keys(extra).length) d.importExtras = extra
+        const client = readJSON('oclientoptions')
+        if (client && typeof client === 'object' && !Array.isArray(client) && Object.keys(client).length) d.clientOptions = client
+        else if (!client || typeof client !== 'object' || Array.isArray(client)) { const e = new Error('客户端专用参数必须是 JSON 对象'); e.field = 'oclientoptions'; throw e }
         if (['vless','vmess'].includes(type)) {
           Object.assign(d, { net: pick('onet'), path: val('opath'), host: val('ohost'), serviceName: val('ogrpc'), mode: pick('omode'), packetEncoding: pick('opacket') })
           if (['ws','httpupgrade'].includes(d.net)) {
@@ -4565,7 +4796,10 @@ function installOwnEditor() {
           }
         }
         if (type !== 'ss') Object.assign(d, { fp: type === 'hysteria2' ? 'none' : pick('ofp'), alpn: val('oalpn').split(',').map(x => x.trim()).filter(Boolean), insecure: get('oinsecure').checked, verifyName:val('overifyname'), certSha256:val('ocertsha256') })
-        if (type === 'vless') Object.assign(d, { pk: val('opk'), sid: val('osid'), flow: pick('oflow'), encryption: val('oencryption') || 'none' })
+        if (type === 'vless') {
+          Object.assign(d, { pk: val('opk'), sid: val('osid'), flow: pick('oflow'), encryption: val('oencryption') || 'none' })
+          if (d.security === 'reality' && pick('orealitypq') !== '') d.realityPQ = pick('orealitypq') === '1'
+        }
         if (type === 'vmess') { d.cipher = pick('ocipher'); d.alterId = Number(val('oalter')) }
         if (type === 'ss') {
           Object.assign(d, { cipher: pick('ocipher'), uot: get('ouot').checked, uotVersion: Number(pick('ouotversion')), plugin: pick('oplugin'), pluginOpts: {} })
@@ -4582,14 +4816,22 @@ function installOwnEditor() {
         return d
       }
       const fill = data => {
+        b.__insecureAcknowledged = false
+        b.__basicAcknowledged = false
+        compatibilityExplicit = data.compatibilityMode !== undefined
         filling = true
         for (const [id, k] of [['on','name'],['os','s'],['op','p'],['ou','u'],['osni','sni'],['opk','pk'],['osid','sid'],['opath','path'],['ohost','host'],['ogrpc','serviceName'],['oencryption','encryption'],['oearly','earlyData'],['oearlyheader','earlyDataHeader'],['oalter','alterId'],['oports','ports'],['ohop','hopInterval'],['oup','upMbps'],['odown','downMbps'],['oopwd','opwd'],['oidlecheck','idleCheck'],['oidletimeout','idleTimeout'],['ominidle','minIdle']]) get(id).value = data[k] ?? (k === 'encryption' ? 'none' : k === 'p' ? 443 : k === 'path' ? '/' : k === 'alterId' ? 0 : '')
         get('oalpn').value = (data.alpn || []).join(','); get('oheaders').value = JSON.stringify(data.headers || {})
         get('overifyname').value = data.verifyName || ''; get('ocertsha256').value = data.certSha256 || ''
         get('oimportextras').value = JSON.stringify(data.importExtras || {})
         get('fimportextras').hidden = !data.importExtras
+        get('oclientoptions').value = JSON.stringify(data.clientOptions || {})
+        get('fclientoptions').hidden = !data.clientOptions
+        get('obasic').checked = data.compatibilityMode === 'basic'
+        get('fcompatmode').hidden = !data.clientOptions
         for (const [id, k] of [['ot','type'],['osecurity','security'],['onet','net'],['oflow','flow'],['ofp','fp'],['ocipher','cipher'],['omode','mode'],['opacket','packetEncoding'],['oobfs','obfs'],['oplugin','plugin']]) choose(id, data[k] ?? (k === 'security' ? 'tls' : k === 'net' ? 'tcp' : k === 'mode' ? 'auto' : k === 'fp' ? 'none' : k === 'cipher' ? 'auto' : ''))
         choose('ouotversion', data.uotVersion || 2)
+        choose('orealitypq', data.realityPQ === undefined ? '' : data.realityPQ ? '1' : '0')
         const po = data.pluginOpts || {}
         choose('opluginmode', po.mode || (data.plugin === 'obfs' ? 'http' : 'websocket'))
         for (const [id, k] of [['opluginhost','host'],['opluginpath','path']]) get(id).value = po[k] || (k === 'path' ? '/' : '')
@@ -4636,6 +4878,23 @@ function installOwnEditor() {
         if (t === 'vmess' && sec === 'reality') choose('osecurity','tls')
         get('ohelp').textContent = '兼容提示：' + (net === 'xhttp' && transport ? 'XHTTP 不支持 sing-box / Shadowrocket 原生 conf；该节点在这些格式中会被剔除。' : '高级参数按客户端能力导出，通用分享链接未必能携带全部参数，请查看订阅预览的提示。')
       }
+      get('ownjson').onclick = async () => {
+        let draft
+        try { draft = readForm() } catch (e) { return toast('请先修正表单中的高级 JSON，再打开节点 JSON 编辑。', true) }
+        b.inert = true
+        try {
+          const result = await ownJSONDialog({ initial: JSON.stringify(draft, null, 2), single: true })
+          if (!result || !b.isConnected) return
+          const imported = { ...defaults(result.node.type), ...result.node }
+          drafts[imported.type] = imported; active = imported.type; fill(imported); sync()
+          get('ownadvanced').open = true
+          if (imported.insecure) await warnInsecure()
+          toast('JSON 已填回表单，核对后点击保存。')
+        } finally {
+          b.inert = false
+          if (b.isConnected) get('ownjson').focus({ preventScroll:true })
+        }
+      }
       b.querySelectorAll('.selo').forEach(opt => opt.addEventListener('click', () => setTimeout(sync, 0)))
       sync()
       const impb = get('oimpb')
@@ -4651,6 +4910,7 @@ function installOwnEditor() {
         const imported = { ...defaults(r.node.type), ...r.node }
         if (imported.importExtras || imported.verifyName || imported.certSha256 || imported.warn) get('ownadvanced').open = true
         drafts[imported.type] = imported; active = imported.type; fill(imported); sync()
+        if (imported.insecure) await warnInsecure()
         say(imported.warn || '已填好，核对后保存')
       })
     }, onSubmit: async b => {
@@ -4660,6 +4920,14 @@ function installOwnEditor() {
       if (!np.s) return { msg: '请填写服务器地址', field:'os' }
       if (!/^\d+$/.test(np.p) || +np.p < 1 || +np.p > 65535) return { msg: '端口要是 1-65535 的数字', field:'op' }
       if (!np.u) return { msg: '请填写 UUID / 认证密码', field:'ou' }
+      if (np.compatibilityMode === 'basic' && !b.__basicAcknowledged) {
+        if (!await confirmBasicCompatibility(b, [np])) return { msg:'尚未确认基础兼容输出，当前草稿已保留。', field:'obasic' }
+        b.__basicAcknowledged = true
+      }
+      if (np.insecure && !b.__insecureAcknowledged) {
+        await acknowledgeInsecure(b, [np])
+        b.__insecureAcknowledged = true
+      }
       const fresh = await api('/api/own')
       if (!fresh || !fresh.ok) return '读取自有节点失败，请刷新后重试'
       const base = fresh.own || {}
@@ -4672,7 +4940,7 @@ function installOwnEditor() {
       }
       const r = await api('/api/own', { own: { ...base, [k]: np } })
       if (!r.ok) {
-        const fields = { name:'on',type:'ot',s:'os',p:'op',u:'ou',security:'osecurity',pk:'opk',sid:'osid',flow:'oflow',cipher:'ocipher',alpn:'oalpn',fp:'ofp',headers:'oheaders',plugin:'oplugin',pluginOpts:'oplugin',obfs:'oobfs',opwd:'oopwd',ports:'oports',encryption:'oencryption',net:'onet',path:'opath',hopInterval:'ohop',upMbps:'oup',downMbps:'odown',idleCheck:'oidlecheck',idleTimeout:'oidletimeout',minIdle:'ominidle',importExtras:'oimportextras',verifyName:'overifyname',certSha256:'ocertsha256' }
+        const fields = { name:'on',type:'ot',s:'os',p:'op',u:'ou',security:'osecurity',pk:'opk',sid:'osid',realityPQ:'orealitypq',flow:'oflow',cipher:'ocipher',alpn:'oalpn',fp:'ofp',headers:'oheaders',plugin:'oplugin',pluginOpts:'oplugin',obfs:'oobfs',opwd:'oopwd',ports:'oports',encryption:'oencryption',net:'onet',path:'opath',hopInterval:'ohop',upMbps:'oup',downMbps:'odown',idleCheck:'oidlecheck',idleTimeout:'oidletimeout',minIdle:'ominidle',importExtras:'oimportextras',clientOptions:'oclientoptions',compatibilityMode:'obasic',verifyName:'overifyname',certSha256:'ocertsha256' }
         b.querySelector('#ownadvanced').open = true
         return { msg: r.msg || '保存失败', field: fields[r.field] || 'on' }
       }
@@ -4686,6 +4954,1085 @@ function installOwnEditor() {
 }
 
 // ---------- 管理端页面 ----------
+
+// JSON imports deliberately use no URI intermediate: it cannot carry every native option.
+function parseOwnJSON(text) {
+  const nodes = [], skipped = [], formats = []
+  let index = 1
+  const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k)
+  const fail = (path, message) => { throw { ownJSONError: true, path, message, msg: `第 ${index} 个节点 ${path}: ${message}` } }
+  const note = (path, message) => skipped.push(`${path}: ${message}`)
+  const object = (o, path) => {
+    if (!o || typeof o !== 'object' || Array.isArray(o)) fail(path, '必须是 JSON 对象')
+    return o
+  }
+  const opts = (o, key, path) => has(o, key) ? object(o[key], path + '.' + key) : {}
+  const keys = (o, allowed, path) => {
+    for (const key of Object.keys(o)) if (!allowed.includes(key)) fail(path + '.' + key, '该字段尚不能无损导入')
+  }
+  const string = (v, path, empty = true) => {
+    if (typeof v !== 'string' || (!empty && !v.trim())) fail(path, empty ? '必须是字符串' : '必须是非空字符串')
+    return v
+  }
+  const boolean = (v, path) => {
+    if (typeof v !== 'boolean') fail(path, '必须是 JSON 布尔值')
+    return v
+  }
+  const number = (v, path) => {
+    if (typeof v !== 'number' || !Number.isFinite(v)) fail(path, '必须是有限的 JSON 数字')
+    return v
+  }
+  const port = (v, path) => {
+    if (typeof v === 'string' && /^(?:0|[1-9]\d*)$/.test(v)) v = Number(v)
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 1 || v > 65535) fail(path, '端口必须是 1-65535 的整数')
+    return v
+  }
+  const duration = (v, path) => {
+    const match = string(v, path, false).match(/^(\d+(?:\.\d+)?)(ms|s|m|h)$/)
+    if (!match) fail(path, '时长必须使用明确的 ms/s/m/h 单位')
+    const seconds = Number(match[1]) * ({ ms: 0.001, s: 1, m: 60, h: 3600 })[match[2]]
+    if (!Number.isInteger(seconds) || seconds <= 0 || seconds > 86400) fail(path, '本站时长字段仅支持 1-86400 整秒')
+    return seconds
+  }
+  const stringList = (v, path) => {
+    if (!Array.isArray(v)) fail(path, '必须是字符串数组')
+    v.forEach((x, i) => string(x, path + '[' + i + ']', false))
+    return v
+  }
+  const unicode = (value, path) => {
+    for (let i = 0; i < value.length; i++) {
+      const code = value.charCodeAt(i)
+      if (code >= 0xD800 && code <= 0xDBFF) {
+        const next = value.charCodeAt(++i)
+        if (!(next >= 0xDC00 && next <= 0xDFFF)) fail(path, '字符串包含孤立的 UTF-16 代理项')
+      } else if (code >= 0xDC00 && code <= 0xDFFF) fail(path, '字符串包含孤立的 UTF-16 代理项')
+    }
+  }
+  const name = (v, path) => {
+    const s = string(v, path, false).trim()
+    if (s.length > 32) fail(path, '名称超过 32 个字符，不能静默截断')
+    return s
+  }
+  const onePath = (v, path) => string(v, path)
+  const joined = (v, path, allowString = true) => {
+    const list = typeof v === 'string' && allowString ? [v] : stringList(v, path)
+    if (list.some(x => x.includes(',') || x !== x.trim())) fail(path, '逗号或首尾空白无法在本站列表字段中无损表示')
+    return list.join(',')
+  }
+  const headers = (v, path) => {
+    object(v, path)
+    const out = {}
+    for (const [key, value] of Object.entries(v)) {
+      string(value, path + '.' + key)
+      const canonical = key.toLowerCase() === 'host' ? 'Host' : key
+      if (has(out, canonical) && out[canonical] !== value) fail(path + '.' + key, '同一个请求头出现不同值')
+      out[canonical] = value
+    }
+    return out
+  }
+  const hostHeaders = (v, path) => {
+    object(v, path)
+    let host
+    for (const [key, value] of Object.entries(v)) {
+      if (key.toLowerCase() !== 'host') fail(path + '.' + key, '本站 HTTP 伪装仅支持 Host 请求头')
+      const next = joined(value, path + '.' + key, false)
+      if (host !== undefined && host !== next) fail(path + '.' + key, 'Host 请求头有冲突值')
+      host = next
+    }
+    return host || ''
+  }
+  const copyFields = (from, to, pairs, path) => {
+    for (const [a, b] of pairs) if (has(from, a)) to[b] = from[a]
+  }
+  const mark = format => { if (!formats.includes(format)) formats.push(format) }
+  const noOp = (o, key, value, path) => {
+    if (!has(o, key)) return
+    if (o[key] !== value) fail(path + '.' + key, '该非默认设置尚不能无损导入')
+    note(path + '.' + key, '等同默认行为，不单独导入')
+  }
+  const metadata = (o, path) => {
+    if (has(o, 'email')) { string(o.email, path + '.email'); note(path + '.email', '用户标识元数据不导入') }
+    noOp(o, 'level', 0, path)
+  }
+  const plugin = (o, path, field = 'pluginOpts') => {
+    const pp = path + '.' + field
+    const po = has(o, 'pluginOpts') ? object(o.pluginOpts, pp) : {}
+    const type = o.plugin || ''
+    if (!['', 'obfs', 'v2ray-plugin'].includes(type)) fail(path + '.plugin', '本站只支持 obfs 和 v2ray-plugin')
+    if (!type && Object.keys(po).length) fail(pp, '未启用插件时不能携带插件参数')
+    keys(po, type === 'obfs' ? ['mode', 'host'] : ['mode', 'host', 'path', 'tls', 'mux'], pp)
+    for (const key of ['mode', 'host', 'path']) if (has(po, key)) string(po[key], pp + '.' + key)
+    for (const key of ['tls', 'mux']) if (has(po, key)) boolean(po[key], pp + '.' + key)
+  }
+  const native = (input, path) => {
+    const o = { ...object(input, path) }, type = o.type
+    const transport = ['vless', 'vmess'].includes(type)
+    const common = ['name', 'type', 's', 'p', 'u', 'sni', 'security', 'udp', 'importExtras', 'clientOptions', 'compatibilityMode']
+    const tls = ['fp', 'alpn', 'insecure', 'verifyName', 'certSha256']
+    const specific = {
+      vless: ['net', 'path', 'host', 'serviceName', 'mode', 'headers', 'earlyData', 'earlyDataHeader', 'packetEncoding', 'flow', 'encryption', 'pk', 'sid', 'realityPQ'],
+      vmess: ['net', 'path', 'host', 'serviceName', 'mode', 'headers', 'earlyData', 'earlyDataHeader', 'packetEncoding', 'cipher', 'alterId'],
+      ss: ['cipher', 'uot', 'uotVersion', 'plugin', 'pluginOpts'],
+      hysteria2: ['obfs', 'opwd', 'ports', 'hopInterval', 'upMbps', 'downMbps'],
+      anytls: ['idleCheck', 'idleTimeout', 'minIdle'],
+    }
+    if (!has(specific, type)) fail(path + '.type', '不支持的节点协议')
+    keys(o, [...common, ...(type === 'ss' ? [] : tls), ...specific[type]], path)
+    o.name = has(o, 'name') ? name(o.name, path + '.name') : type.toUpperCase() + ' ' + index
+    for (const key of ['s', 'u']) string(o[key], path + '.' + key, false)
+    if (!['string', 'number'].includes(typeof o.p)) fail(path + '.p', '端口必须是整数或整数字符串')
+    for (const key of ['sni', 'security', 'net', 'path', 'host', 'serviceName', 'mode', 'earlyDataHeader', 'packetEncoding', 'flow', 'encryption', 'pk', 'sid', 'fp', 'verifyName', 'certSha256', 'cipher', 'plugin', 'obfs', 'opwd', 'ports']) if (has(o, key)) string(o[key], path + '.' + key)
+    for (const key of ['udp', 'insecure', 'uot']) if (has(o, key)) boolean(o[key], path + '.' + key)
+    for (const key of ['alterId', 'uotVersion', 'earlyData', 'hopInterval', 'upMbps', 'downMbps', 'idleCheck', 'idleTimeout', 'minIdle']) if (has(o, key)) number(o[key], path + '.' + key)
+    if (has(o, 'alpn')) stringList(o.alpn, path + '.alpn')
+    const sec = o.security === undefined ? type === 'vless' ? o.net === 'ws' ? 'tls' : 'reality' : ['ss', 'vmess'].includes(type) ? 'none' : 'tls' : o.security
+    // A new import must not inherit the old HY2 record's insecure TLS default.
+    if (['hysteria2', 'anytls'].includes(type) && o.security === undefined) o.security = 'tls'
+    if (type !== 'ss' && !has(o, 'insecure')) o.insecure = false
+    if (type === 'ss' && sec !== 'none') fail(path + '.security', '本站 SS 没有外层 TLS 字段，请使用插件自身的 TLS 配置')
+    if (sec === 'none') {
+      for (const key of ['sni', 'verifyName', 'certSha256']) if (o[key]) fail(path + '.' + key, '未启用 TLS 时该设置不会生效')
+      if (o.insecure === true) fail(path + '.insecure', '未启用 TLS 时该设置不会生效')
+      if (o.alpn && o.alpn.length) fail(path + '.alpn', '未启用 TLS 时该设置不会生效')
+      if (o.fp && !['none', 'chrome'].includes(o.fp)) fail(path + '.fp', '未启用 TLS 时该设置不会生效')
+    }
+    if (type === 'vless' && sec !== 'reality') for (const key of ['pk', 'sid']) {
+      if (o[key]) fail(path + '.' + key, '仅 Reality 可以使用该参数')
+      delete o[key]
+    }
+    if (transport) {
+      const net = o.net || 'tcp'
+      const applicable = { path: ['ws', 'httpupgrade', 'h2', 'http', 'xhttp'], host: ['ws', 'httpupgrade', 'h2', 'http', 'xhttp'], serviceName: ['grpc'], mode: ['xhttp'], headers: ['ws', 'httpupgrade'], earlyData: ['ws', 'httpupgrade'], earlyDataHeader: ['ws', 'httpupgrade'] }
+      const empty = (key, v) => v === '' || key === 'path' && v === '/' || key === 'mode' && v === 'auto' || key === 'earlyData' && v === 0 || key === 'headers' && v && typeof v === 'object' && !Array.isArray(v) && !Object.keys(v).length
+      for (const [key, nets] of Object.entries(applicable)) if (has(o, key) && !nets.includes(net)) {
+        if (!empty(key, o[key])) fail(path + '.' + key, '该参数不适用于当前传输方式')
+        delete o[key]
+      }
+      if (has(o, 'headers')) {
+        o.headers = headers(o.headers, path + '.headers')
+        if (o.host && o.headers.Host && o.host !== o.headers.Host) fail(path + '.headers.Host', '与 host 字段冲突')
+      }
+      if (has(o, 'earlyDataHeader') && !o.earlyData && o.earlyDataHeader && o.earlyDataHeader !== 'Sec-WebSocket-Protocol') fail(path + '.earlyDataHeader', '未启用 Early Data 时该自定义设置不会生效')
+      if (sec === 'reality' && !['tcp', 'grpc', 'xhttp'].includes(net)) fail(path + '.net', 'Reality 仅支持 TCP/RAW、gRPC 或 XHTTP')
+    }
+    if (type === 'ss') plugin(o, path)
+    if (type === 'hysteria2' && !o.obfs && o.opwd) fail(path + '.opwd', '未启用混淆时不能携带混淆密码')
+    return o
+  }
+  const clash = (input, path) => {
+    object(input, path)
+    input = { ...input }
+    const type = input.type, transport = ['vless', 'vmess'].includes(type)
+    const allowed = {
+      vless: ['uuid', 'flow', 'encryption', 'packet-encoding'], vmess: ['uuid', 'cipher', 'alterId', 'packet-encoding'],
+      ss: ['password', 'cipher', 'udp-over-tcp', 'udp-over-tcp-version', 'plugin', 'plugin-opts'],
+      hysteria2: ['password', 'ports', 'hop-interval', 'up', 'down', 'obfs', 'obfs-password'],
+      anytls: ['password', 'idle-session-check-interval', 'idle-session-timeout', 'min-idle-session'],
+    }
+    if (!has(allowed, type)) fail(path + '.type', '本站不支持该 Clash/Mihomo 代理协议')
+    if (type === 'vless') for (const [key, value] of [['alterId', 0], ['cipher', 'auto']]) if (has(input, key)) {
+      noOp(input, key, value, path)
+      delete input[key]
+    }
+    if (has(input, 'flow') && input.flow === null) {
+      note(path + '.flow', '导出器的空默认值，不启用 Flow')
+      if (type === 'vless') input.flow = ''
+      else delete input.flow
+    }
+    const tlsKeys = ['tls', 'sni', 'servername', 'skip-cert-verify', 'client-fingerprint', 'alpn', 'fingerprint', 'name-cert-verify', 'reality-opts']
+    keys(input, ['name', 'type', 'server', 'port', 'udp', ...allowed[type], ...(type === 'ss' ? [] : tlsKeys), ...(transport ? ['network', 'ws-opts', 'grpc-opts', 'h2-opts', 'http-opts', 'xhttp-opts'] : [])], path)
+    const o = { name: has(input, 'name') ? input.name : type.toUpperCase() + ' ' + index, type, s: input.server, p: port(input.port, path + '.port'), u: transport ? input.uuid : input.password }
+    const source = { name: path + '.name', s: path + '.server', p: path + '.port', u: path + (transport ? '.uuid' : '.password') }
+    name(o.name, source.name); string(o.s, source.s, false); string(o.u, source.u, false)
+    o.udp = has(input, 'udp') ? boolean(input.udp, path + '.udp') : type === 'hysteria2'
+    if (type === 'ss') {
+      o.security = 'none'
+      o.cipher = string(input.cipher, path + '.cipher', false)
+      if (has(input, 'udp-over-tcp')) o.uot = boolean(input['udp-over-tcp'], path + '.udp-over-tcp')
+      if (has(input, 'udp-over-tcp-version')) o.uotVersion = number(input['udp-over-tcp-version'], path + '.udp-over-tcp-version')
+      else if (o.uot) o.uotVersion = 1
+      if (has(input, 'plugin')) o.plugin = string(input.plugin, path + '.plugin')
+      if (has(input, 'plugin-opts')) o.pluginOpts = object(input['plugin-opts'], path + '.plugin-opts')
+      source.pluginOpts = path + '.plugin-opts'
+      plugin(o, path, 'plugin-opts')
+      return { o, source }
+    }
+    const tls = has(input, 'tls') ? boolean(input.tls, path + '.tls') : ['hysteria2', 'anytls'].includes(type)
+    if (['hysteria2', 'anytls'].includes(type) && !tls) fail(path + '.tls', '该协议必须启用 TLS')
+    const reality = has(input, 'reality-opts') ? object(input['reality-opts'], path + '.reality-opts') : null
+    if (reality && !tls) fail(path + '.tls', 'Reality 不能与 tls:false 同时使用')
+    o.security = reality ? 'reality' : tls ? 'tls' : 'none'
+    const sameName = has(input, 'servername') && has(input, 'sni')
+    if (sameName && input.servername !== input.sni) fail(path + '.sni', '与 servername 字段冲突')
+    copyFields(input, o, [['servername', 'sni'], ['sni', 'sni'], ['skip-cert-verify', 'insecure'], ['client-fingerprint', 'fp'], ['alpn', 'alpn'], ['fingerprint', 'certSha256'], ['name-cert-verify', 'verifyName']], path)
+    for (const [a, b] of [['servername', 'sni'], ['sni', 'sni'], ['skip-cert-verify', 'insecure'], ['client-fingerprint', 'fp'], ['fingerprint', 'certSha256'], ['name-cert-verify', 'verifyName'], ['alpn', 'alpn']]) if (has(input, a)) source[b] = path + '.' + a
+    if (has(o, 'insecure')) boolean(o.insecure, source.insecure)
+    else o.insecure = false
+    if (reality) {
+      keys(reality, ['public-key', 'short-id', 'support-x25519mlkem768'], path + '.reality-opts')
+      o.pk = string(reality['public-key'], path + '.reality-opts.public-key', false)
+      o.sid = has(reality, 'short-id') ? string(reality['short-id'], path + '.reality-opts.short-id') : ''
+      source.pk = path + '.reality-opts.public-key'; source.sid = path + '.reality-opts.short-id'
+      if (has(reality, 'support-x25519mlkem768')) {
+        o.realityPQ = boolean(reality['support-x25519mlkem768'], path + '.reality-opts.support-x25519mlkem768')
+        source.realityPQ = path + '.reality-opts.support-x25519mlkem768'
+      }
+      if (!has(o, 'fp')) o.fp = 'chrome'
+    }
+    if (!tls) for (const key of tlsKeys.filter(k => !['tls', 'reality-opts'].includes(k))) if (has(input, key)) fail(path + '.' + key, '未启用 TLS 时不能导入 TLS 参数')
+    if (transport) {
+      o.net = has(input, 'network') ? string(input.network, path + '.network', false) : 'tcp'
+      if (o.net === 'raw') o.net = 'tcp'
+      o.packetEncoding = has(input, 'packet-encoding') ? input['packet-encoding'] : ''
+      source.net = path + '.network'; source.packetEncoding = path + '.packet-encoding'
+      const transportKeys = { 'ws-opts': 'ws', 'grpc-opts': 'grpc', 'h2-opts': 'h2', 'http-opts': 'http', 'xhttp-opts': 'xhttp' }
+      for (const [key, net] of Object.entries(transportKeys)) if (has(input, key) && o.net !== net) fail(path + '.' + key, '与 network 不匹配，不能静默丢弃')
+      const tp = path + '.' + (o.net === 'grpc' ? 'grpc-opts' : o.net + '-opts')
+      const tr = opts(input, o.net === 'grpc' ? 'grpc-opts' : o.net + '-opts', path)
+      if (o.net === 'ws') {
+        keys(tr, ['path', 'headers', 'max-early-data', 'early-data-header-name', 'v2ray-http-upgrade'], tp)
+        if (has(tr, 'path')) o.path = onePath(tr.path, tp + '.path')
+        if (has(tr, 'headers')) { o.headers = headers(tr.headers, tp + '.headers'); if (o.headers.Host) o.host = o.headers.Host }
+        if (has(tr, 'max-early-data')) o.earlyData = number(tr['max-early-data'], tp + '.max-early-data')
+        if (has(tr, 'early-data-header-name')) o.earlyDataHeader = string(tr['early-data-header-name'], tp + '.early-data-header-name')
+        if (has(tr, 'v2ray-http-upgrade') && boolean(tr['v2ray-http-upgrade'], tp + '.v2ray-http-upgrade')) o.net = 'httpupgrade'
+      } else if (o.net === 'grpc') {
+        keys(tr, ['grpc-service-name'], tp)
+        if (has(tr, 'grpc-service-name')) o.serviceName = string(tr['grpc-service-name'], tp + '.grpc-service-name')
+      } else if (o.net === 'h2') {
+        keys(tr, ['path', 'host'], tp)
+        if (has(tr, 'path')) o.path = onePath(tr.path, tp + '.path')
+        if (has(tr, 'host')) o.host = joined(tr.host, tp + '.host', false)
+      } else if (o.net === 'http') {
+        keys(tr, ['path', 'headers', 'method'], tp)
+        noOp(tr, 'method', 'GET', tp)
+        if (has(tr, 'path')) o.path = joined(tr.path, tp + '.path', false)
+        if (has(tr, 'headers')) o.host = hostHeaders(tr.headers, tp + '.headers')
+      } else if (o.net === 'xhttp') {
+        if (type !== 'vless') fail(path + '.network', 'Mihomo 的 XHTTP 仅支持 VLESS')
+        keys(tr, ['path', 'host', 'mode'], tp)
+        copyFields(tr, o, [['path', 'path'], ['host', 'host'], ['mode', 'mode']], tp)
+      }
+      for (const key of ['path', 'host', 'headers', 'earlyData', 'earlyDataHeader', 'serviceName', 'mode']) if (has(o, key)) source[key] = tp + '.' + ({ earlyData: 'max-early-data', earlyDataHeader: 'early-data-header-name', serviceName: 'grpc-service-name' }[key] || key)
+      if (type === 'vless') {
+        o.flow = has(input, 'flow') ? input.flow : ''
+        o.encryption = has(input, 'encryption') ? input.encryption === '' ? 'none' : input.encryption : 'none'
+      } else {
+        o.cipher = has(input, 'cipher') ? input.cipher : 'auto'
+        o.alterId = has(input, 'alterId') ? input.alterId : 0
+      }
+    } else if (type === 'hysteria2') {
+      copyFields(input, o, [['obfs', 'obfs'], ['obfs-password', 'opwd'], ['hop-interval', 'hopInterval']], path)
+      if (has(input, 'ports')) o.ports = string(input.ports, path + '.ports').replace(/\//g, ',')
+      for (const [a, b] of [['up', 'upMbps'], ['down', 'downMbps']]) if (has(input, a)) {
+        const value = input[a]
+        if (typeof value === 'number') o[b] = number(value, path + '.' + a)
+        else {
+          const match = string(value, path + '.' + a).trim().match(/^(\d+(?:\.\d+)?)\s*(bps|Kbps|Mbps|Gbps|Tbps|Bps|KBps|MBps|GBps)?$/)
+          if (!match) fail(path + '.' + a, '带宽单位无法无损换算为 Mbps')
+          const factor = { bps: 0.000001, Kbps: 0.001, Mbps: 1, Gbps: 1000, Tbps: 1000000, Bps: 0.000008, KBps: 0.008, MBps: 8, GBps: 8000 }
+          o[b] = Number(match[1]) * (match[2] ? factor[match[2]] : 1)
+        }
+        source[b] = path + '.' + a
+      }
+    } else copyFields(input, o, [['idle-session-check-interval', 'idleCheck'], ['idle-session-timeout', 'idleTimeout'], ['min-idle-session', 'minIdle']], path)
+    for (const [a, b] of [['obfs-password', 'opwd'], ['hop-interval', 'hopInterval'], ['idle-session-check-interval', 'idleCheck'], ['idle-session-timeout', 'idleTimeout'], ['min-idle-session', 'minIdle']]) if (has(input, a)) source[b] = path + '.' + a
+    return { o, source }
+  }
+  const xrayStream = (input, type, path) => {
+    const stream = input === undefined ? {} : object(input, path)
+    keys(stream, ['network', 'method', 'security', 'tlsSettings', 'realitySettings', 'tcpSettings', 'rawSettings', 'wsSettings', 'httpupgradeSettings', 'grpcSettings', 'httpSettings', 'xhttpSettings', 'splithttpSettings', 'finalmask'], path)
+    const aliases = { raw: 'tcp', tcp: 'tcp', ws: 'ws', websocket: 'ws', httpupgrade: 'httpupgrade', grpc: 'grpc', http: 'h2', h2: 'h2', xhttp: 'xhttp', splithttp: 'xhttp' }
+    for (const key of ['network', 'method']) if (has(stream, key)) string(stream[key], path + '.' + key, false)
+    const net = aliases[stream.method || stream.network || 'raw']
+    if (!net) fail(path + (has(stream, 'method') ? '.method' : '.network'), '不支持的 Xray 传输方式')
+    if (has(stream, 'method') && has(stream, 'network') && aliases[stream.method] !== aliases[stream.network]) fail(path + '.network', '与 method 字段冲突')
+    const sec = has(stream, 'security') ? string(stream.security, path + '.security', false) : 'none'
+    if (!['none', 'tls', 'reality'].includes(sec)) fail(path + '.security', '不支持的传输安全模式')
+    for (const [key, security] of [['tlsSettings', 'tls'], ['realitySettings', 'reality']]) if (has(stream, key) && sec !== security) fail(path + '.' + key, '与 security 不匹配，不能静默丢弃')
+    const o = { security: sec, net, packetEncoding: '' }, source = { security: path + '.security', net: path + (has(stream, 'method') ? '.method' : '.network') }
+    if (has(stream, 'finalmask')) {
+      const mask = object(stream.finalmask, path + '.finalmask')
+      keys(mask, ['tcp', 'udp'], path + '.finalmask')
+      for (const key of Object.keys(mask)) if (!Array.isArray(mask[key])) fail(path + '.finalmask.' + key, '必须是 JSON 数组')
+      if (Object.keys(mask).length) o.clientOptions = { xray: { finalmask: mask } }
+      else note(path + '.finalmask', '空的传输混淆配置，不单独导入')
+      source['clientOptions.xray.finalmask'] = path + '.finalmask'
+      source.clientOptions = path + '.finalmask'
+    }
+    if (sec !== 'none') {
+      const key = sec === 'tls' ? 'tlsSettings' : 'realitySettings', tp = path + '.' + key, tls = opts(stream, key, path)
+      keys(tls, sec === 'tls' ? ['serverName', 'allowInsecure', 'alpn', 'fingerprint', 'verifyPeerCertByName', 'pinnedPeerCertSha256', 'echConfigList', 'echForceQuery'] : ['serverName', 'fingerprint', 'publicKey', 'password', 'shortId', 'show'], tp)
+      if (has(tls, 'serverName')) {
+        o.sni = string(tls.serverName, tp + '.serverName')
+        if (o.sni === 'FromMitM') fail(tp + '.serverName', '动态 MitM SNI 不能保存为静态节点')
+        source.sni = tp + '.serverName'
+      }
+      o.fp = has(tls, 'fingerprint') ? string(tls.fingerprint, tp + '.fingerprint') : 'chrome'
+      if (o.fp === 'unsafe' && sec === 'tls') o.fp = 'none'
+      source.fp = tp + '.fingerprint'
+      if (sec === 'tls') {
+        const ech = {}
+        for (const field of ['echConfigList', 'echForceQuery']) if (has(tls, field)) {
+          const value = string(tls[field], tp + '.' + field)
+          if (value) ech[field] = value
+          source['clientOptions.xray.tlsSettings.' + field] = tp + '.' + field
+        }
+        if (Object.keys(ech).length) {
+          o.clientOptions = o.clientOptions || { xray: {} }
+          o.clientOptions.xray.tlsSettings = ech
+          source.clientOptions = has(stream, 'finalmask') ? path : tp
+        }
+        o.insecure = has(tls, 'allowInsecure') ? boolean(tls.allowInsecure, tp + '.allowInsecure') : false
+        o.alpn = has(tls, 'alpn') ? stringList(tls.alpn, tp + '.alpn') : ['ws', 'httpupgrade'].includes(net) ? ['http/1.1'] : ['h2', 'http/1.1']
+        if (o.alpn.includes('FromMitM')) fail(tp + '.alpn', '动态 MitM ALPN 不能保存为静态节点')
+        source.alpn = tp + '.alpn'; source.insecure = tp + '.allowInsecure'
+        if (has(tls, 'verifyPeerCertByName')) {
+          const value = string(tls.verifyPeerCertByName, tp + '.verifyPeerCertByName')
+          if (value.includes(',') || value === 'FromMitM') fail(tp + '.verifyPeerCertByName', '本站仅支持一个静态证书校验域名')
+          o.verifyName = value; source.verifyName = tp + '.verifyPeerCertByName'
+        }
+        if (has(tls, 'pinnedPeerCertSha256')) {
+          o.certSha256 = string(tls.pinnedPeerCertSha256, tp + '.pinnedPeerCertSha256')
+          if (o.certSha256.includes(',')) fail(tp + '.pinnedPeerCertSha256', '本站仅支持一个完整证书 SHA256 指纹')
+          source.certSha256 = tp + '.pinnedPeerCertSha256'
+        }
+      } else {
+        if (type !== 'vless') fail(path + '.security', '本站仅 VLESS 支持 Reality')
+        if (!['tcp', 'grpc', 'xhttp'].includes(net)) fail(source.net, 'Reality 仅支持 TCP/RAW、gRPC 或 XHTTP')
+        if (has(tls, 'publicKey') && has(tls, 'password') && tls.publicKey !== tls.password) fail(tp + '.publicKey', '与 password 字段冲突')
+        o.pk = string(has(tls, 'password') ? tls.password : tls.publicKey, tp + (has(tls, 'password') ? '.password' : '.publicKey'), false)
+        o.sid = has(tls, 'shortId') ? string(tls.shortId, tp + '.shortId') : ''
+        source.pk = tp + (has(tls, 'password') ? '.password' : '.publicKey'); source.sid = tp + '.shortId'
+        noOp(tls, 'show', false, tp)
+      }
+    }
+    const sets = { tcpSettings: 'tcp', rawSettings: 'tcp', wsSettings: 'ws', httpupgradeSettings: 'httpupgrade', grpcSettings: 'grpc', httpSettings: 'h2', xhttpSettings: 'xhttp', splithttpSettings: 'xhttp' }
+    const present = []
+    for (const [key, expected] of Object.entries(sets)) if (has(stream, key)) {
+      if (net !== expected) fail(path + '.' + key, '与传输方式不匹配，不能静默丢弃')
+      present.push(key)
+    }
+    if (present.length > 1) fail(path + '.' + present[1], '重复的传输配置不能无损合并')
+    const key = present[0], tr = key ? object(stream[key], path + '.' + key) : {}, tp = path + '.' + (key || net + 'Settings')
+    if (net === 'tcp') {
+      keys(tr, ['header', 'acceptProxyProtocol'], tp)
+      noOp(tr, 'acceptProxyProtocol', false, tp)
+      if (has(tr, 'header')) {
+        const h = object(tr.header, tp + '.header'), hp = tp + '.header'
+        keys(h, ['type', 'request', 'response'], hp)
+        if (h.type === 'none') {
+          if (has(h, 'request') || has(h, 'response')) fail(hp, 'none 伪装不能携带 HTTP 请求或响应配置')
+        } else if (h.type === 'http') {
+          if (has(h, 'response')) fail(hp + '.response', '本站不支持自定义 HTTP 伪装响应')
+          const request = opts(h, 'request', hp), rp = hp + '.request'
+          keys(request, ['version', 'method', 'path', 'headers'], rp)
+          noOp(request, 'version', '1.1', rp); noOp(request, 'method', 'GET', rp)
+          o.net = 'http'
+          o.path = has(request, 'path') ? joined(request.path, rp + '.path', false) : '/'
+          if (has(request, 'headers')) o.host = hostHeaders(request.headers, rp + '.headers')
+          source.path = rp + '.path'; source.host = rp + '.headers.Host'
+        } else fail(hp + '.type', '不支持的 TCP/RAW 伪装方式')
+      }
+    } else if (['ws', 'httpupgrade'].includes(net)) {
+      keys(tr, ['path', 'host', 'headers', 'acceptProxyProtocol'], tp)
+      noOp(tr, 'acceptProxyProtocol', false, tp)
+      o.path = has(tr, 'path') ? onePath(tr.path, tp + '.path') : '/'
+      const queryAt = o.path.indexOf('?'), query = queryAt < 0 ? [] : o.path.slice(queryAt + 1).split('&')
+      for (const part of query) {
+        const rawKey = part.split('=')[0]
+        let decodedKey
+        try { decodedKey = decodeURIComponent(rawKey.replace(/\+/g, ' ')) } catch (error) { fail(tp + '.path', '查询参数名含无效的百分号编码') }
+        if (decodedKey === 'ed' && rawKey !== 'ed') fail(tp + '.path', '不能无损导入百分号编码的 ed 参数别名')
+      }
+      const ed = query.filter(part => part.split('=')[0] === 'ed')
+      if (ed.length) {
+        if (net === 'httpupgrade') fail(tp + '.path', '本站 HTTPUpgrade 无法无损下发 Xray 路径内 Early Data')
+        if (ed.length !== 1 || !/^ed=\d+$/.test(ed[0]) || +ed[0].slice(3) > 8192) fail(tp + '.path', 'WebSocket ed 必须是单个 0-8192 整数')
+        o.earlyData = Number(ed[0].slice(3)); o.earlyDataHeader = 'Sec-WebSocket-Protocol'
+        const rest = query.filter(part => !part.startsWith('ed=')).join('&')
+        o.path = o.path.slice(0, queryAt) + (rest ? '?' + rest : '')
+        source.earlyData = tp + '.path'; source.earlyDataHeader = tp + '.path'
+      }
+      if (has(tr, 'headers')) o.headers = headers(tr.headers, tp + '.headers')
+      if (has(tr, 'host')) {
+        o.host = string(tr.host, tp + '.host')
+        if (o.headers && o.headers.Host && o.host && o.headers.Host !== o.host) fail(tp + '.headers.Host', '与 host 字段冲突，不能静默覆盖')
+        if (!o.host && o.headers && o.headers.Host) o.host = o.headers.Host
+      } else if (o.headers && o.headers.Host) o.host = o.headers.Host
+    } else if (net === 'grpc') {
+      keys(tr, ['serviceName', 'multiMode'], tp)
+      noOp(tr, 'multiMode', false, tp)
+      if (has(tr, 'serviceName')) o.serviceName = string(tr.serviceName, tp + '.serviceName')
+    } else if (net === 'h2') {
+      keys(tr, ['path', 'host'], tp)
+      if (has(tr, 'path')) o.path = onePath(tr.path, tp + '.path')
+      if (has(tr, 'host')) o.host = joined(tr.host, tp + '.host', false)
+    } else if (net === 'xhttp') {
+      keys(tr, ['path', 'host', 'mode'], tp)
+      copyFields(tr, o, [['path', 'path'], ['host', 'host'], ['mode', 'mode']], tp)
+    }
+    for (const field of ['path', 'host', 'headers', 'serviceName', 'mode']) if (has(o, field) && !source[field]) source[field] = tp + '.' + field
+    if (type === 'ss') {
+      if (sec !== 'none') fail(path + '.security', '本站 SS 不支持 Xray 的外层 TLS/Reality')
+      if (o.net !== 'tcp') fail(source.net, '本站 SS 不支持 Xray 的自定义传输层')
+      delete o.net; delete o.packetEncoding
+    }
+    return { o, source }
+  }
+  const singbox = (input, path) => {
+    object(input, path)
+    const type = input.type === 'shadowsocks' ? 'ss' : input.type
+    const transport = ['vless', 'vmess'].includes(type)
+    const allowed = {
+      vless: ['uuid', 'flow', 'packet_encoding'],
+      vmess: ['uuid', 'security', 'alter_id', 'packet_encoding'],
+      ss: ['method', 'password', 'udp_over_tcp'],
+      hysteria2: ['password', 'server_ports', 'hop_interval', 'up_mbps', 'down_mbps', 'obfs'],
+      anytls: ['password', 'idle_session_check_interval', 'idle_session_timeout', 'min_idle_session'],
+    }
+    if (!has(allowed, type)) fail(path + '.type', '本站不支持该 sing-box 出站协议')
+    keys(input, ['type', 'tag', 'server', 'server_port', ...allowed[type], ...(type === 'ss' ? [] : ['tls']), ...(transport ? ['transport'] : [])], path)
+    const o = { type, name: has(input, 'tag') ? name(input.tag, path + '.tag') : type.toUpperCase() + ' ' + index, s: input.server, u: transport ? input.uuid : input.password }
+    const source = { name: path + '.tag', s: path + '.server', p: path + '.server_port', u: path + (transport ? '.uuid' : '.password') }
+    string(o.s, source.s, false); string(o.u, source.u, false)
+    const put = (from, target, fromPath = path, field = input) => {
+      if (has(field, from)) { o[target] = field[from]; source[target] = fromPath + '.' + from }
+    }
+    if (type === 'hysteria2' && has(input, 'server_ports')) {
+      const ranges = stringList(input.server_ports, path + '.server_ports')
+      if (!ranges.length || ranges.length > 100) fail(path + '.server_ports', '端口跳跃必须是 1-100 项端口范围数组')
+      const parsed = ranges.map((range, i) => {
+        const rp = path + '.server_ports[' + i + ']', match = range.match(/^(\d+):(\d+)$/)
+        if (!match) fail(rp, '端口范围必须是 起始端口:结束端口')
+        const start = port(match[1], rp), end = port(match[2], rp)
+        if (start > end) fail(rp, '端口范围起点不能大于终点')
+        return { start, text: start === end ? String(start) : start + '-' + end }
+      })
+      o.ports = parsed.map(x => x.text).join(','); source.ports = path + '.server_ports'
+      o.p = parsed[0].start; source.p = path + '.server_ports[0]'
+      if (has(input, 'server_port')) {
+        port(input.server_port, path + '.server_port')
+        note(path + '.server_port', 'server_ports 覆盖单端口，使用首个范围起点作为本站基础端口')
+      }
+    } else o.p = port(input.server_port, source.p)
+    if (type === 'ss') {
+      o.security = 'none'
+      o.cipher = string(input.method, path + '.method', false); source.cipher = path + '.method'
+      if (has(input, 'udp_over_tcp')) {
+        const uot = input.udp_over_tcp
+        if (typeof uot === 'boolean') { o.uot = uot; if (uot) o.uotVersion = 2 }
+        else {
+          const up = path + '.udp_over_tcp'
+          object(uot, up); keys(uot, ['enabled', 'version'], up)
+          o.uot = has(uot, 'enabled') ? boolean(uot.enabled, up + '.enabled') : false
+          if (has(uot, 'version')) { o.uotVersion = number(uot.version, up + '.version'); source.uotVersion = up + '.version' }
+          else if (o.uot) o.uotVersion = 2
+        }
+        source.uot = path + '.udp_over_tcp'
+      }
+      return { o, source }
+    }
+    const tls = opts(input, 'tls', path), tp = path + '.tls'
+    keys(tls, ['enabled', 'server_name', 'insecure', 'alpn', 'utls', 'reality', 'fragment', 'record_fragment', 'fragment_fallback_delay'], tp)
+    const enabled = has(tls, 'enabled') ? boolean(tls.enabled, tp + '.enabled') : ['anytls', 'hysteria2'].includes(type)
+    if (['anytls', 'hysteria2'].includes(type) && !enabled) fail(tp + '.enabled', '该协议必须启用 TLS')
+    if (!enabled && Object.keys(tls).some(k => k !== 'enabled')) fail(tp, '未启用 TLS 时不能静默忽略 TLS 设置')
+    o.security = enabled ? 'tls' : 'none'; o.insecure = false
+    source.security = tp + '.enabled'; source.insecure = tp + '.insecure'
+    if (enabled) {
+      if (has(tls, 'server_name')) o.sni = string(tls.server_name, tp + '.server_name')
+      source.sni = tp + '.server_name'
+      if (has(tls, 'insecure')) o.insecure = boolean(tls.insecure, tp + '.insecure')
+      if (has(tls, 'alpn')) { o.alpn = stringList(tls.alpn, tp + '.alpn'); source.alpn = tp + '.alpn' }
+      if (has(tls, 'utls')) {
+        const utls = object(tls.utls, tp + '.utls'), up = tp + '.utls'
+        keys(utls, ['enabled', 'fingerprint'], up)
+        const active = has(utls, 'enabled') ? boolean(utls.enabled, up + '.enabled') : false
+        if (active) o.fp = has(utls, 'fingerprint') ? string(utls.fingerprint, up + '.fingerprint', false) : 'chrome'
+        else {
+          if (has(utls, 'fingerprint')) fail(up + '.fingerprint', '未启用 uTLS 时该指纹不会生效')
+          o.fp = 'none'
+        }
+        source.fp = up + '.fingerprint'
+      } else o.fp = 'none'
+      if (has(tls, 'reality')) {
+        const reality = object(tls.reality, tp + '.reality'), rp = tp + '.reality'
+        keys(reality, ['enabled', 'public_key', 'short_id'], rp)
+        const active = has(reality, 'enabled') ? boolean(reality.enabled, rp + '.enabled') : false
+        if (active) {
+          if (type !== 'vless') fail(rp, '本站仅 VLESS 支持 Reality')
+          o.security = 'reality'; o.pk = string(reality.public_key, rp + '.public_key', false)
+          o.sid = has(reality, 'short_id') ? string(reality.short_id, rp + '.short_id') : ''
+          source.pk = rp + '.public_key'; source.sid = rp + '.short_id'; source.security = rp + '.enabled'
+        } else if (Object.keys(reality).some(k => k !== 'enabled')) fail(rp, '未启用 Reality 时不能静默忽略公钥等设置')
+      }
+      const extra = {}
+      for (const field of ['fragment', 'record_fragment']) if (has(tls, field)) {
+        extra[field] = boolean(tls[field], tp + '.' + field)
+        source['clientOptions.singbox.tls.' + field] = tp + '.' + field
+      }
+      if (has(tls, 'fragment_fallback_delay')) {
+        extra.fragment_fallback_delay = string(tls.fragment_fallback_delay, tp + '.fragment_fallback_delay', false)
+        if (!/^\d+(?:\.\d+)?(?:ms|s|m|h)$/.test(extra.fragment_fallback_delay)) fail(tp + '.fragment_fallback_delay', '时长必须使用明确的 ms/s/m/h 单位')
+        source['clientOptions.singbox.tls.fragment_fallback_delay'] = tp + '.fragment_fallback_delay'
+      }
+      if (Object.keys(extra).length) { o.clientOptions = { singbox: { tls: extra } }; source.clientOptions = tp }
+    }
+    if (transport) {
+      o.net = 'tcp'; o.packetEncoding = ''
+      put('packet_encoding', 'packetEncoding')
+      if (type === 'vless') { o.encryption = 'none'; o.flow = ''; put('flow', 'flow') }
+      else { o.cipher = 'auto'; o.alterId = 0; put('security', 'cipher'); put('alter_id', 'alterId') }
+      if (has(input, 'transport')) {
+        const tr = object(input.transport, path + '.transport'), rp = path + '.transport'
+        const net = string(tr.type, rp + '.type', false)
+        const fields = { ws: ['path', 'headers', 'max_early_data', 'early_data_header_name'], httpupgrade: ['host', 'path', 'headers'], grpc: ['service_name'], http: ['host', 'path', 'method', 'headers'] }
+        if (!has(fields, net)) fail(rp + '.type', '本站尚不支持该 sing-box 传输方式')
+        keys(tr, ['type', ...fields[net]], rp)
+        o.net = net === 'http' ? 'h2' : net; source.net = rp + '.type'
+        if (has(tr, 'path')) { o.path = onePath(tr.path, rp + '.path'); source.path = rp + '.path' }
+        if (has(tr, 'headers')) {
+          if (net === 'http') fail(rp + '.headers', '本站 h2 无法无损保存自定义 HTTP 请求头')
+          o.headers = headers(tr.headers, rp + '.headers'); source.headers = rp + '.headers'
+          if (o.headers.Host) { o.host = o.headers.Host; source.host = rp + '.headers.Host' }
+        }
+        if (has(tr, 'host')) {
+          const host = net === 'http' ? joined(tr.host, rp + '.host', false) : string(tr.host, rp + '.host')
+          if (o.host && host !== o.host) fail(rp + '.host', '与 headers.Host 冲突')
+          o.host = host; source.host = rp + '.host'
+        }
+        if (['ws', 'httpupgrade'].includes(net) && !o.host) {
+          // WS uses server authority; HTTPUpgrade prefers the effective TLS name.
+          const address = o.s.includes(':') && !o.s.startsWith('[') ? '[' + o.s + ']' : o.s
+          o.host = net === 'httpupgrade' && enabled ? o.sni || address : address + ':' + o.p
+          source.host = net === 'httpupgrade' && enabled && o.sni ? tp + '.server_name' : path + '.server'
+        }
+        noOp(tr, 'method', 'GET', rp)
+        for (const [a, b] of [['max_early_data', 'earlyData'], ['early_data_header_name', 'earlyDataHeader'], ['service_name', 'serviceName']]) if (has(tr, a)) { o[b] = tr[a]; source[b] = rp + '.' + a }
+      }
+    } else if (type === 'hysteria2') {
+      put('up_mbps', 'upMbps'); put('down_mbps', 'downMbps')
+      if (has(input, 'hop_interval')) { o.hopInterval = duration(input.hop_interval, path + '.hop_interval'); source.hopInterval = path + '.hop_interval' }
+      else if (o.ports) o.hopInterval = 30
+      if (has(input, 'obfs')) {
+        const obfs = object(input.obfs, path + '.obfs')
+        keys(obfs, ['type', 'password'], path + '.obfs')
+        o.obfs = string(obfs.type, path + '.obfs.type', false); o.opwd = string(obfs.password, path + '.obfs.password', false)
+        source.obfs = path + '.obfs.type'; source.opwd = path + '.obfs.password'
+      }
+    } else {
+      for (const [a, b] of [['idle_session_check_interval', 'idleCheck'], ['idle_session_timeout', 'idleTimeout']]) if (has(input, a)) { o[b] = duration(input[a], path + '.' + a); source[b] = path + '.' + a }
+      put('min_idle_session', 'minIdle')
+    }
+    return { o, source }
+  }
+  const append = (o, source, path) => {
+    if (nodes.length >= 100) fail(path, '一次最多导入 100 个节点（包括展开的用户）')
+    let mapped
+    try { mapped = native(o, path) } catch (error) {
+      if (!error || !error.ownJSONError) throw error
+      for (const [field, original] of Object.entries(source)) {
+        const prefix = path + '.' + field
+        if (error.path === prefix || error.path.startsWith(prefix + '.') || error.path.startsWith(prefix + '[')) fail(original + error.path.slice(prefix.length), error.message)
+      }
+      throw error
+    }
+    const normalized = normalizeOwnNode(mapped)
+    if (normalized.err) {
+      let original = source[normalized.field]
+      if (!original && normalized.field) for (const field of Object.keys(source).sort((a, b) => b.length - a.length)) if (normalized.field.startsWith(field + '.') || normalized.field.startsWith(field + '[')) {
+        original = source[field] + normalized.field.slice(field.length)
+        break
+      }
+      fail(original || path + (normalized.field ? '.' + normalized.field : ''), normalized.err)
+    }
+    nodes.push(normalized.node)
+  }
+  const xray = (input, path) => {
+    object(input, path)
+    const protocol = string(input.protocol, path + '.protocol', false)
+    mark('Xray JSON')
+    if (['freedom', 'direct', 'blackhole', 'dns', 'loopback'].includes(protocol)) {
+      note(path, protocol + ' 非代理出站，不导入')
+      return
+    }
+    if (!['vless', 'vmess', 'shadowsocks'].includes(protocol)) fail(path + '.protocol', '本站不支持该 Xray 代理协议（不把 HY2/AnyTLS 猜测成 Xray 协议）')
+    keys(input, ['tag', 'protocol', 'settings', 'streamSettings', 'mux'], path)
+    if (has(input, 'mux')) {
+      const mux = object(input.mux, path + '.mux')
+      keys(mux, ['enabled', 'concurrency'], path + '.mux')
+      if (mux.enabled !== false) fail(path + '.mux.enabled', '仅支持忽略明确禁用的 mux，活动复用无法无损导入')
+      noOp(mux, 'concurrency', -1, path + '.mux')
+      note(path + '.mux', '已明确禁用复用，不单独导入')
+    }
+    const type = protocol === 'shadowsocks' ? 'ss' : protocol, settings = object(input.settings, path + '.settings'), sp = path + '.settings'
+    const base = xrayStream(input.streamSettings, type, path + '.streamSettings')
+    const label = has(input, 'tag') ? name(input.tag, path + '.tag') : type.toUpperCase() + ' ' + index
+    const entries = []
+    const userKeys = type === 'vless' ? ['id', 'encryption', 'flow', 'level', 'email'] : ['id', 'security', 'alterId', 'level', 'email', 'experiments']
+    if (type === 'ss') {
+      keys(settings, ['servers', 'address', 'port', 'method', 'password', 'level', 'email'], sp)
+      const servers = has(settings, 'servers') ? settings.servers : [settings]
+      if (!Array.isArray(servers) || !servers.length) fail(sp + '.servers', '必须是非空服务器数组')
+      if (has(settings, 'servers') && Object.keys(settings).some(k => k !== 'servers')) fail(sp, 'servers 数组不能与平铺服务器字段混用')
+      servers.forEach((server, i) => {
+        const ep = has(settings, 'servers') ? sp + '.servers[' + i + ']' : sp
+        object(server, ep); keys(server, ['address', 'port', 'method', 'password', 'level', 'email'], ep); metadata(server, ep)
+        const cipher = string(server.method, ep + '.method', false)
+        entries.push({ s: server.address, p: server.port, u: server.password, cipher: ({ 'chacha20-poly1305': 'chacha20-ietf-poly1305', 'xchacha20-poly1305': 'xchacha20-ietf-poly1305' })[cipher] || cipher, path: ep, userPath: ep })
+      })
+    } else {
+      keys(settings, ['vnext', 'address', 'port', ...userKeys], sp)
+      const servers = has(settings, 'vnext') ? settings.vnext : [settings]
+      if (!Array.isArray(servers) || !servers.length) fail(sp + '.vnext', '必须是非空服务器数组')
+      if (has(settings, 'vnext') && Object.keys(settings).some(k => k !== 'vnext')) fail(sp, 'vnext 数组不能与平铺用户字段混用')
+      servers.forEach((server, i) => {
+        const ep = has(settings, 'vnext') ? sp + '.vnext[' + i + ']' : sp
+        object(server, ep)
+        if (has(settings, 'vnext')) keys(server, ['address', 'port', 'users'], ep)
+        const users = has(settings, 'vnext') ? server.users : [server]
+        if (!Array.isArray(users) || !users.length) fail(ep + '.users', '必须是非空用户数组')
+        users.forEach((user, j) => {
+          const up = has(settings, 'vnext') ? ep + '.users[' + j + ']' : ep
+          object(user, up)
+          keys(user, has(settings, 'vnext') ? userKeys : ['address', 'port', ...userKeys], up)
+          metadata(user, up)
+          const entry = { s: server.address, p: server.port, u: user.id, path: ep, userPath: up }
+          if (type === 'vless') {
+            entry.encryption = string(user.encryption, up + '.encryption', false)
+            entry.flow = has(user, 'flow') ? string(user.flow, up + '.flow') : ''
+          } else {
+            entry.cipher = has(user, 'security') ? string(user.security, up + '.security', false) : 'auto'
+            entry.alterId = has(user, 'alterId') ? number(user.alterId, up + '.alterId') : 0
+            noOp(user, 'experiments', '', up)
+          }
+          entries.push(entry)
+        })
+      })
+    }
+    if (nodes.length + entries.length > 100) fail(sp, '一次最多导入 100 个节点（包括展开的用户）')
+    entries.forEach((entry, i) => {
+      const suffix = entries.length > 1 ? ' ' + (i + 1) : '', ep = entry.path, up = entry.userPath
+      const o = { ...base.o, ...entry, type, name: label + suffix }
+      delete o.path; delete o.userPath
+      if (has(base.o, 'path')) o.path = base.o.path
+      if (['ws', 'httpupgrade'].includes(o.net) && !o.host) o.host = entry.s
+      const source = { ...base.source, name: path + '.tag', s: ep + '.address', p: ep + '.port', u: up + (type === 'ss' ? '.password' : '.id'), cipher: up + (type === 'ss' ? '.method' : '.security'), encryption: up + '.encryption', flow: up + '.flow', alterId: up + '.alterId' }
+      o.p = port(o.p, source.p)
+      string(o.s, source.s, false); string(o.u, source.u, false)
+      append(o, source, path)
+    })
+  }
+  const readInput = source => {
+    let input = source.trim().replace(/^\uFEFF/, '')
+    // Repair only trailing commas outside JSON strings; never rewrite string data.
+    let repaired = '', quoted = false, escaped = false
+    for (let i = 0; i < input.length; i++) {
+      const ch = input[i]
+      if (quoted) {
+        repaired += ch
+        if (escaped) escaped = false
+        else if (ch === '\\') escaped = true
+        else if (ch === '"') quoted = false
+      } else if (ch === '"') { quoted = true; repaired += ch }
+      else if (ch === ',') {
+        let next = i + 1
+        while (/\s/.test(input[next] || '') && next < input.length) next++
+        if (next < input.length && ![']', '}'].includes(input[next])) repaired += ch
+      } else repaired += ch
+    }
+    if (/^"(?:[^"\\]|\\.)*"\s*:/.test(repaired)) repaired = '{' + repaired + '}'
+    try { return JSON.parse(repaired) } catch (error) {
+      // A failed JSON parse may only enter the deliberately small YAML grammar.
+      if (!/^(?:\{|\[|-\s|---\s|#|["']|[A-Za-z_][\w-]*\s*:)/.test(input)) fail('$', 'JSON / YAML 语法不正确，请检查引号、逗号、括号和缩进')
+    }
+    const yamlError = message => fail('$', '安全 YAML 子集: ' + message)
+    const checkKey = key => {
+      if (['__proto__', 'constructor', 'prototype', '<<'].includes(key)) yamlError('禁止危险属性名或合并键')
+      if (!key || key.length > 256 || /[\x00-\x1f\x7f]/.test(key)) yamlError('属性名为空、过长或含控制字符')
+    }
+    const scalar = raw => {
+      const value = raw.trim()
+      if (!value) yamlError('缺少值')
+      if (/^[!&*|>@`]/.test(value)) yamlError('不支持标签、锚点、别名或多行标量')
+      if (/^(?:true|false)$/.test(value)) return value === 'true'
+      if (/^(?:null|~)$/.test(value)) return null
+      if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(value)) {
+        const n = Number(value)
+        if (!Number.isFinite(n)) yamlError('数值超出有限范围')
+        return n
+      }
+      return value
+    }
+    const flow = (text, depth) => {
+      let at = 0
+      const space = () => { while (at < text.length && /\s/.test(text[at])) at++ }
+      const quote = () => {
+        const start = at, kind = text[at++]
+        let value = ''
+        while (at < text.length) {
+          const ch = text[at++]
+          if (ch === kind) {
+            if (kind === "'" && text[at] === "'") { value += "'"; at++; continue }
+            if (kind === "'") return value
+            try { return JSON.parse(text.slice(start, at)) } catch (error) { yamlError('双引号字符串转义不正确') }
+          }
+          if (kind === '"' && ch === '\\') {
+            if (at >= text.length) yamlError('字符串未闭合')
+            value += ch + text[at++]
+          } else value += ch
+        }
+        yamlError('字符串未闭合')
+      }
+      const read = level => {
+        if (level > 16) yamlError('嵌套深度不能超过 16 层')
+        space()
+        if (text[at] === '"' || text[at] === "'") return quote()
+        if (text[at] === '{') {
+          at++; space()
+          const result = Object.create(null)
+          if (text[at] === '}') { at++; return result }
+          while (at < text.length) {
+            space()
+            let key
+            if (text[at] === '"' || text[at] === "'") key = quote()
+            else {
+              const start = at
+              while (at < text.length && !/[:{},\[\]]/.test(text[at])) at++
+              key = text.slice(start, at).trim()
+              if (/^[!&*]/.test(key)) yamlError('属性名不支持标签、锚点或别名')
+            }
+            checkKey(key); space()
+            if (text[at++] !== ':') yamlError('映射键之后必须有冒号')
+            if (has(result, key)) yamlError('不允许重复属性名')
+            result[key] = read(level + 1); space()
+            const ch = text[at++]
+            if (ch === '}') return result
+            if (ch !== ',') yamlError('映射项目之间必须有逗号')
+            space()
+            if (text[at] === '}') { at++; return result }
+          }
+          yamlError('映射括号未闭合')
+        }
+        if (text[at] === '[') {
+          at++; space()
+          const result = []
+          if (text[at] === ']') { at++; return result }
+          while (at < text.length) {
+            result.push(read(level + 1)); space()
+            const ch = text[at++]
+            if (ch === ']') return result
+            if (ch !== ',') yamlError('数组项目之间必须有逗号')
+            space()
+            if (text[at] === ']') { at++; return result }
+          }
+          yamlError('数组括号未闭合')
+        }
+        const start = at
+        while (at < text.length && !/[,\[\]{}]/.test(text[at])) at++
+        return scalar(text.slice(start, at))
+      }
+      const value = read(depth)
+      space()
+      if (at !== text.length) yamlError('值之后存在无法识别的内容')
+      return value
+    }
+    const splitPair = line => {
+      let quote = '', escape = false
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i]
+        if (quote) {
+          if (escape) escape = false
+          else if (quote === '"' && ch === '\\') escape = true
+          else if (ch === quote) {
+            if (quote === "'" && line[i + 1] === "'") i++
+            else quote = ''
+          }
+        } else if (ch === '"' || ch === "'") quote = ch
+        else if (ch === ':' && (i + 1 === line.length || /\s/.test(line[i + 1]))) return [line.slice(0, i).trim(), line.slice(i + 1).trim()]
+      }
+      return null
+    }
+    const lines = []
+    let pending = '', indent = 0, quote = '', escape = false, brackets = 0
+    // Whole-input trim would remove only the first node's original indentation.
+    for (const raw of source.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n')) {
+      if (/^\s*\t/.test(raw) || /^ +\t/.test(raw)) yamlError('缩进不能使用 Tab')
+      if (!pending) indent = raw.length - raw.trimStart().length
+      let cleaned = ''
+      for (let i = 0; i < raw.length; i++) {
+        const ch = raw[i]
+        if (quote) {
+          cleaned += ch
+          if (escape) escape = false
+          else if (quote === '"' && ch === '\\') escape = true
+          else if (ch === quote) {
+            if (quote === "'" && raw[i + 1] === "'") { cleaned += raw[++i] }
+            else quote = ''
+          }
+        } else if (ch === '#' && (i === 0 || /\s/.test(raw[i - 1]))) break
+        else {
+          cleaned += ch
+          if (ch === '"' || ch === "'") quote = ch
+          else if (ch === '{' || ch === '[') brackets++
+          else if (ch === '}' || ch === ']') { brackets--; if (brackets < 0) yamlError('括号不匹配') }
+        }
+      }
+      if (quote) yamlError('不支持跨行的引号字符串')
+      if (!cleaned.trim() && !pending) continue
+      pending += (pending ? ' ' : '') + cleaned.trim()
+      if (brackets) continue
+      if (pending === '---' && !lines.length) { pending = ''; continue }
+      if (pending === '---' || pending === '...') yamlError('只允许一个 YAML 文档')
+      const match = pending.match(/^-\s+(.+)$/)
+      if (match && !/^[{\[]/.test(match[1]) && splitPair(match[1])) {
+        lines.push({ indent, text: '-' }, { indent: indent + 2, text: match[1] })
+      } else lines.push({ indent, text: pending })
+      pending = ''
+    }
+    if (pending || brackets) yamlError('括号未闭合')
+    if (!lines.length) yamlError('内容为空')
+    // Closed flow maps have no block children; align only entire node-list roots.
+    const flowNode = row => /^-\s+\{.*\}$/.test(row.text)
+    if (lines.every(flowNode)) {
+      for (const row of lines) row.indent = lines[0].indent
+    } else if (!/^-(?:\s|$)/.test(lines[0].text)) {
+      const rootLevel = lines[0].indent
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].indent !== rootLevel) continue
+        const pair = splitPair(lines[i].text)
+        if (!pair || pair[1] || !['proxies', '"proxies"', "'proxies'"].includes(pair[0])) continue
+        let end = i + 1
+        while (end < lines.length && lines[end].indent >= rootLevel && flowNode(lines[end])) end++
+        const next = lines[end]
+        if (next && (next.indent !== rootLevel || /^-(?:\s|$)/.test(next.text) || !splitPair(next.text))) continue
+        for (let node = i + 1; node < end; node++) lines[node].indent = rootLevel + 2
+      }
+    }
+    let pos = 0
+    const block = (level, depth) => {
+      if (depth > 16) yamlError('嵌套深度不能超过 16 层')
+      const sequence = /^-(?:\s|$)/.test(lines[pos].text), result = sequence ? [] : Object.create(null)
+      while (pos < lines.length && lines[pos].indent === level) {
+        if (sequence && !/^-(?:\s|$)/.test(lines[pos].text)) break
+        const row = lines[pos++].text
+        if (sequence) {
+          if (!/^-(?:\s|$)/.test(row)) yamlError('数组和映射不能混用同一缩进')
+          const rest = row.replace(/^-(?:\s+|$)/, '')
+          if (rest) result.push(flow(rest, depth + 1))
+          else result.push(pos < lines.length && lines[pos].indent > level ? block(lines[pos].indent, depth + 1) : null)
+        } else {
+          const pair = splitPair(row)
+          if (!pair) yamlError('块映射项目必须为 键: 值')
+          const key = /^["']/.test(pair[0]) ? flow(pair[0], depth + 1) : pair[0]
+          if (typeof key !== 'string' || /^[!&*]/.test(key)) yamlError('映射键必须是普通字符串')
+          checkKey(key)
+          if (has(result, key)) yamlError('不允许重复属性名')
+          const child = pos < lines.length && (lines[pos].indent > level || lines[pos].indent === level && /^-(?:\s|$)/.test(lines[pos].text))
+          result[key] = pair[1] ? flow(pair[1], depth + 1) : child ? block(lines[pos].indent, depth + 1) : null
+        }
+        if (pos < lines.length && lines[pos].indent > level) yamlError('存在不匹配的额外缩进')
+      }
+      return result
+    }
+    if (lines.length === 1 && /^[{\[]/.test(lines[0].text)) return flow(lines[0].text, 0)
+    const result = block(lines[0].indent, 0)
+    if (pos !== lines.length) yamlError('顶层缩进不一致')
+    return result
+  }
+  try {
+    if (typeof text !== 'string') fail('$', '请输入 JSON 字符串')
+    if (new TextEncoder().encode(text).length > 256 * 1024) fail('$', 'JSON 内容超过 256 KiB UTF-8 限制')
+    const root = readInput(text)
+    const stack = [{ value: root, path: '$', depth: 0 }]
+    while (stack.length) {
+      const { value, path, depth } = stack.pop()
+      if (depth > 16) fail(path, 'JSON 嵌套深度不能超过 16 层')
+      if (typeof value === 'number' && !Number.isFinite(value)) fail(path, '数值超出有限范围')
+      if (typeof value === 'string') unicode(value, path)
+      if (value && typeof value === 'object') for (const key of Object.keys(value)) {
+        unicode(key, path + '.[属性名]')
+        const next = Array.isArray(value) ? path + '[' + key + ']' : path + '.' + key
+        if (['__proto__', 'constructor', 'prototype'].includes(key)) fail(next, '禁止危险属性名')
+        if (key.length > 256 || /[\x00-\x1f\x7f]/.test(key)) fail(path, '属性名过长或含控制字符')
+        stack.push({ value: value[key], path: next, depth: depth + 1 })
+      }
+    }
+    let list, prefix, forced
+    if (Array.isArray(root)) { list = root; prefix = '$' }
+    else {
+      object(root, '$')
+      if (has(root, 'proxies') && has(root, 'outbounds')) fail('$', '同时出现 proxies 与 outbounds，无法确定导入格式')
+      const container = has(root, 'proxies') ? 'proxies' : has(root, 'outbounds') ? 'outbounds' : ''
+      if (container) {
+        if (!Array.isArray(root[container])) fail('$.' + container, '节点列表必须是 JSON 数组')
+        list = root[container]; prefix = '$.' + container; forced = container === 'outbounds' ? 'outbound' : 'clash'
+        for (const key of Object.keys(root)) if (key !== container) note('$.' + key, '顶层配置不导入，仅提取节点列表')
+      } else { list = [root]; prefix = ''; }
+    }
+    if (!list.length) fail(prefix || '$', '没有可导入的节点')
+    list.forEach((input, i) => {
+      index = i + 1
+      const path = prefix ? prefix + '[' + i + ']' : '$'
+      object(input, path)
+      if (has(input, 'protocol') && has(input, 'type')) fail(path, '同时出现 protocol 与 type，无法确定节点格式')
+      if (has(input, 'protocol')) xray(input, path)
+      else if (forced === 'outbound' || has(input, 'server_port') || has(input, 'server_ports') || has(input, 'tag') && has(input, 'server')) {
+        mark('sing-box JSON')
+        if (['direct', 'block', 'dns'].includes(input.type)) { note(path, input.type + ' 非代理出站，不导入'); return }
+        if (!has(input, 'type')) {
+          const candidates = []
+          if (has(input, 'method')) candidates.push('shadowsocks')
+          if (['server_ports', 'hop_interval', 'up_mbps', 'down_mbps', 'obfs'].some(k => has(input, k))) candidates.push('hysteria2')
+          if (['idle_session_check_interval', 'idle_session_timeout', 'min_idle_session'].some(k => has(input, k))) candidates.push('anytls')
+          if (has(input, 'uuid') && (has(input, 'alter_id') || has(input, 'security'))) candidates.push('vmess')
+          if (has(input, 'uuid') && has(input, 'flow')) candidates.push('vless')
+          if (candidates.length !== 1) fail(path + '.type', '无法唯一推断协议，请提供明确的 type')
+          input = { ...input, type: candidates[0] }
+          note(path + '.type', '依据协议专属字段推断为 ' + candidates[0])
+        }
+        const parsed = singbox(input, path)
+        append(parsed.o, parsed.source, path)
+      } else if (forced === 'clash' || has(input, 'server')) {
+        mark('Clash/Mihomo JSON')
+        const parsed = clash(input, path)
+        append(parsed.o, parsed.source, path)
+      } else {
+        if (has(input, 'settings') || has(input, 'streamSettings')) fail(path + '.protocol', '无法唯一推断 Xray 协议，请提供明确的 protocol')
+        mark('本站 JSON')
+        append(input, {}, path)
+      }
+    })
+    if (!nodes.length) fail(prefix || '$', '没有可导入的代理节点（非代理出站不会导入）')
+    return { ok: true, nodes, skipped, formats }
+  } catch (error) {
+    if (!error || error.ownJSONError !== true) throw error
+    return { ok: false, msg: error.msg }
+  }
+}
+
+function installOwnJSONUI() {
+  const uuid = '11111111-2222-3333-4444-555555555555'
+  const clashNode = type => ({ name:'示例 ' + type.toUpperCase(), type, server:'example.com', port:type === 'ss' ? 8388 : 443,
+    ...(['vless','vmess'].includes(type) ? {uuid, tls:true, servername:'example.com', ...(type === 'vless' ? {encryption:'none', flow:''} : {cipher:'auto', alterId:0})} : {password:'your-password', ...(type === 'ss' ? {cipher:'aes-128-gcm'} : {sni:'example.com'})}) })
+  const singboxNode = type => ({ type:type === 'ss' ? 'shadowsocks' : type, tag:'示例 ' + type.toUpperCase(), server:'example.com', server_port:type === 'ss' ? 8388 : 443,
+    ...(['vless','vmess'].includes(type) ? {uuid, ...(type === 'vmess' ? {security:'auto', alter_id:0} : {flow:''})} : {password:'your-password', ...(type === 'ss' ? {method:'aes-128-gcm'} : {})}),
+    ...(type === 'ss' ? {} : {tls:{enabled:true, server_name:'example.com', insecure:false}}) })
+  const xrayNode = type => ({ tag:'示例 ' + type.toUpperCase(), protocol:type === 'ss' ? 'shadowsocks' : type,
+    settings:{address:'example.com', port:type === 'ss' ? 8388 : 443,
+      ...(type === 'ss' ? {method:'aes-128-gcm', password:'your-password'} : {id:uuid, ...(type === 'vless' ? {encryption:'none'} : {security:'auto', alterId:0})})},
+    ...(type === 'ss' ? {} : {streamSettings:{network:'tcp', security:'tls', tlsSettings:{serverName:'example.com', allowInsecure:false}}}) })
+  const protocols = [['ss','SS'],['vless','VLESS'],['vmess','VMess'],['hysteria2','HY2'],['anytls','AnyTLS']]
+  const examples = [
+    ['Clash / Mihomo · SS / VLESS / VMess / HY2 / AnyTLS', protocols.map(([type, label]) => [label, clashNode(type)])],
+    ['Xray / v2rayN · SS / VLESS / VMess', protocols.slice(0,3).map(([type, label]) => [label, xrayNode(type)])],
+    ['sing-box / v2rayN · SS / VLESS / VMess / HY2 / AnyTLS', protocols.map(([type, label]) => [label, singboxNode(type)])],
+  ]
+  window.ownJSONDialog = async ({ initial = '', single = false } = {}) => {
+    let parsed = null, parsedText = '', saving = false
+    const html = `<div class="json-examples" id="ownjsonexamples">${examples.map(([label, items]) => `<details><summary>${esc(label)}</summary>${items.map(([protocol, example]) => `<div class="json-example"><b>${esc(protocol)}</b><pre>${esc(JSON.stringify(example, null, 2))}</pre></div>`).join('')}</details>`).join('')}</div>
+      <div class="hint">自动识别单个节点、节点数组、完整配置、outbounds / proxies 片段和 Clash YAML；无需完整外壳。只提取节点，专用参数保留并提示兼容范围。配置可能含密码，请勿截图外发。</div>
+      <div class="fg"><label class="lb" for="ownjsontext">${single ? '节点 JSON / YAML' : '批量节点 JSON / YAML'}</label>
+        <textarea class="own-json-text" id="ownjsontext" spellcheck="false" autocomplete="off" maxlength="262144" placeholder="${esc(JSON.stringify(examples[0][1][0][1], null, 2))}">${esc(initial)}</textarea>
+        <div class="hint">每批最多 100 个节点、256 KiB。解析在此浏览器内完成，确认保存前不上传 JSON。</div></div>
+      ${single ? '' : '<div><button type="button" class="g" id="ownjsonparse">解析并预览</button></div><div class="json-preview" id="ownjsonpreview" role="status" aria-live="polite">尚未解析，不会保存任何节点。</div>'}`
+    const box = await modal({ title:single ? '编辑节点配置' : '批量导入 JSON / YAML', html, wide:true, ok:single ? '解析并填回' : '确认导入',
+      onMount:b => {
+        if (single) return
+        const input = b.querySelector('#ownjsontext'), preview = b.querySelector('#ownjsonpreview'), save = b.querySelector('[data-ok]')
+        save.disabled = true
+        input.addEventListener('input', () => { if (!saving) { parsed = null; save.disabled = true; preview.textContent = '内容已修改，请重新解析预览。' } })
+        b.querySelector('#ownjsonparse').onclick = () => {
+          if (saving) return
+          b.querySelectorAll('.ferr').forEach(e => e.remove())
+          parsed = parseOwnJSON(input.value)
+          parsedText = input.value
+          save.disabled = !parsed.ok
+          if (!parsed.ok) { preview.textContent = parsed.msg; parsed = null; return }
+          preview.innerHTML = `<b>识别到 ${parsed.nodes.length} 个节点</b><ol>${parsed.nodes.map(n => `<li>${esc(n.name)} · ${esc(n.type.toUpperCase())}</li>`).join('')}</ol>${parsed.nodes.some(n => n.clientOptions) ? '<div class="alert info">原参数会保留；无法等效表达的格式默认不下发。明确启用基础兼容输出后可下发基础配置，请查看保存后的兼容提示。</div>' : ''}${parsed.skipped.length ? `<div class="hint">${parsed.skipped.map(esc).join('<br>')}</div>` : ''}`
+        }
+      }, onSubmit:async b => {
+        const input = b.querySelector('#ownjsontext')
+        if (single) {
+          const result = parseOwnJSON(input.value)
+          if (!result.ok) return { msg:result.msg, field:'ownjsontext' }
+          if (result.nodes.length !== 1) return { msg:'单节点编辑只允许一条节点配置；多条请使用批量导入。', field:'ownjsontext' }
+          b.__json = { node:result.nodes[0] }
+          return null
+        }
+        if (!parsed || !parsed.ok || parsedText !== input.value) return { msg:'请先解析并预览当前 JSON，再确认导入。', field:'ownjsontext' }
+        if (saving) return '正在保存，请勿重复提交。'
+        const batch = parsed.nodes
+        const parseButton = b.querySelector('#ownjsonparse')
+        saving = true; input.disabled = true; parseButton.disabled = true
+        try {
+          if (!await confirmBasicCompatibility(b, batch)) return '尚未确认基础兼容输出，当前输入与预览已保留。'
+          await acknowledgeInsecure(b, batch)
+          const fresh = await api('/api/own')
+          if (!fresh || !fresh.ok) return '读取现有节点失败，请稍后重试；当前输入已保留。'
+          const own = { ...fresh.own }, names = new Set(Object.values(own).map(n => n.name))
+          for (const node of batch) {
+            if (names.has(node.name)) return { msg:'节点名称重复：' + node.name + '。请修改名称后重新解析。', field:'ownjsontext' }
+            names.add(node.name)
+            const prefix = 'n' + Math.abs([...node.name].reduce((n, c) => n * 31 + c.charCodeAt(0) | 0, 7)).toString(36)
+            let key = prefix
+            for (let i = 2; own[key]; i++) key = prefix + '-' + i
+            own[key] = node
+          }
+          const result = await api('/api/own', { own })
+          if (!result.ok) return result.msg || '保存失败，当前输入已保留。'
+          b.__json = { count:batch.length }
+          return null
+        } finally {
+          saving = false; input.disabled = false; parseButton.disabled = false
+        }
+      } })
+    return box && box.__json
+  }
+  window.importOwnJSON = async () => {
+    const result = await ownJSONDialog()
+    if (!result) return
+    OWN = POL = PRF = CH = null
+    toast('已导入 ' + result.count + ' 个自有节点')
+    dash(true)
+  }
+  window.setOwnAddMenu = open => {
+    const button = document.getElementById('ownadd'), menu = document.getElementById('ownaddmenu')
+    if (!button || !menu) return
+    menu.hidden = !open
+    button.setAttribute('aria-expanded', String(!!open))
+  }
+  window.toggleOwnAdd = button => {
+    const menu = document.getElementById('ownaddmenu')
+    setOwnAddMenu(button.parentElement.dataset.hover === '1' || menu.hidden)
+  }
+  window.hoverOwnAdd = (event, root) => {
+    if (event.pointerType !== 'mouse') return
+    root.dataset.hover = '1'
+    setOwnAddMenu(true)
+  }
+  window.leaveOwnAdd = root => {
+    root.dataset.hover = ''
+    if (!root.contains(document.activeElement)) setOwnAddMenu(false)
+  }
+  window.blurOwnAdd = (event, root) => { if (!root.contains(event.relatedTarget)) setOwnAddMenu(false) }
+  window.keyOwnAdd = event => {
+    if (event.key === 'ArrowDown') { event.preventDefault(); event.stopPropagation(); setOwnAddMenu(true); document.getElementById('ownaddmenu').querySelector('button').focus() }
+  }
+  document.addEventListener('click', event => { if (!event.target.closest('.own-add')) setOwnAddMenu(false) })
+  document.addEventListener('keydown', event => {
+    const menu = document.getElementById('ownaddmenu')
+    if (!menu || menu.hidden || !event.target.closest('.own-add')) return
+    if (event.key === 'Escape') { event.preventDefault(); setOwnAddMenu(false); document.getElementById('ownadd').focus() }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      const items = [...menu.querySelectorAll('button')], index = items.indexOf(document.activeElement)
+      if (index < 0) return
+      event.preventDefault()
+      items[(index + (event.key === 'ArrowDown' ? 1 : items.length - 1)) % items.length].focus()
+    }
+  })
+}
 
 function adminHTML(authed, inited, needToken) {
   return `<!DOCTYPE html>
@@ -5025,9 +6372,23 @@ input.bad:focus,textarea.bad:focus{border-color:var(--warn);box-shadow:0 0 0 3.5
 .bd.out .md{animation:mdOut .16s var(--e) both}
 .md h3{font-size:15.5px;font-weight:600;letter-spacing:-.01em;padding-right:34px}
 .md p{color:var(--tx2);font-size:13.5px;margin-top:7px;line-height:1.6}
-.md .bdy{padding:15px 0;display:flex;flex-direction:column;gap:9px}
-.md .ft{display:flex;gap:8px;justify-content:flex-end;align-items:center;padding:14px 23px 20px;flex-shrink:0;border-top:1px solid transparent;transition:border-color .18s var(--e)}
+.md .bdy{padding:4px 0 12px;display:flex;flex-direction:column;gap:14px}
+.md .bdy > :is(p,.alert,.fg,.own-fields,.own-check){margin:0}
+.md .ft{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;align-items:center;padding:14px 23px 20px;flex-shrink:0;border-top:1px solid transparent;transition:border-color .18s var(--e)}
 .md .ft .left{margin-right:auto;display:flex;gap:6px}
+.own-add{position:relative;display:inline-flex}
+.own-add > button{min-height:38px;padding:7px 13px;gap:8px}
+.own-add-menu{position:absolute;right:0;top:100%;padding-top:6px;min-width:180px;z-index:25}
+.own-add-menu > [role="menu"]{display:block;padding:5px;border:1px solid var(--bd);border-radius:11px;background:var(--card);box-shadow:var(--shP);animation:popIn .18s var(--e) both}
+#owncard:has(.own-add-menu:not([hidden])){position:relative;z-index:3}
+.own-add-menu button{width:100%;background:none;color:var(--tx2);padding:9px 11px;text-align:left;justify-content:flex-start}
+.own-add-menu button:hover,.own-add-menu button:focus-visible{background:var(--hov);color:var(--tx)}
+.json-examples{display:grid;gap:8px;padding:10px 12px;border:1px solid var(--bd2);border-radius:9px;background:var(--bg)}
+.json-examples summary{cursor:pointer;color:var(--tx2);font-size:12px;font-weight:500}
+.json-examples pre{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--tx3);font:11.5px/1.6 var(--mono);margin-top:7px}
+.own-json-text{min-height:190px;max-height:45vh;tab-size:2}
+.json-preview{color:var(--tx2);font-size:12.5px;line-height:1.7;overflow-wrap:anywhere}
+.json-preview ol{padding-left:22px}
 .fg{margin-bottom:14px}.fg:last-child{margin-bottom:0}
 .own-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:end;gap:12px;margin-bottom:14px}
 .own-fields.own-address{grid-template-columns:minmax(0,1fr) 112px}
@@ -5189,6 +6550,7 @@ input.bad:focus,textarea.bad:focus{border-color:var(--warn);box-shadow:0 0 0 3.5
   .md .ft{padding:12px 18px max(16px,env(safe-area-inset-bottom))}
   .md .ft button{flex:1;justify-content:center}
   .md .ft .left{flex-basis:100%;margin:0 0 4px}
+  .md .ft .left button{flex:0 1 auto}
   .md .row{flex-wrap:wrap}
   .prof{padding:12px}
   .prof .hdr{flex-wrap:wrap}
@@ -5309,7 +6671,7 @@ function toast(msg, err){
 }
 
 let modalId = 0
-function modal({title, desc, html = '', fields = [], ok = '确定', danger = false, wide = false, xl = false, noCancel = false, foot = '', onMount, onSubmit}){
+function modal({title, desc, html = '', fields = [], ok = '确定', danger = false, wide = false, xl = false, noCancel = false, ackOnly = false, foot = '', onMount, onSubmit}){
   return new Promise(resolve => {
     const bd = document.createElement('div')
     const opener = document.activeElement
@@ -5317,18 +6679,21 @@ function modal({title, desc, html = '', fields = [], ok = '确定', danger = fal
     bd.className = 'bd'
     bd.innerHTML = \`<div class="md \${xl?'xl':wide?'lg':''}" role="dialog" aria-modal="true" aria-labelledby="\${titleId}">
       <div class="hd"><h3 id="\${titleId}">\${esc(title)}</h3>\${desc ? \`<p>\${esc(desc)}</p>\` : ''}
-        <button type="button" class="ib x" data-close aria-label="关闭">\${icon('x')}</button></div>
+        \${ackOnly ? '' : \`<button type="button" class="ib x" data-close aria-label="关闭">\${icon('x')}</button>\`}</div>
       <div class="ct">
         \${html ? \`<div class="bdy">\${html}</div>\` : ''}
         \${fields.length ? \`<div class="bdy">\${fields.map((f,i)=>\`<input data-i="\${i}" placeholder="\${esc(f.ph||'')}" value="\${esc(f.val||'')}">\`).join('')}</div>\` : ''}
       </div>
-      <div class="ft">\${foot ? \`<span class="left">\${foot}</span>\` : ''}\${noCancel?'':'<button class="g" data-x>取消</button>'}
+      <div class="ft">\${foot ? \`<span class="left">\${foot}</span>\` : ''}\${noCancel || ackOnly?'':'<button class="g" data-x>取消</button>'}
         <button data-ok class="\${danger?'dg':''}">\${esc(ok)}</button></div>
     </div>\`
     document.body.appendChild(bd)
     const box = bd.querySelector('.md')
     const inputs = [...bd.querySelectorAll('.bdy input[data-i]')]
-    setTimeout(() => (inputs[0] || bd.querySelector('.ct input:not([disabled]),.ct textarea') || bd.querySelector('[data-ok]')).focus(), 60)
+    const focusTimer = setTimeout(() => {
+      if (bd.classList.contains('out') || [...document.querySelectorAll('.bd:not(.out)')].pop() !== bd || box.contains(document.activeElement)) return
+      ;(inputs[0] || bd.querySelector('.ct input:not([disabled]),.ct textarea') || bd.querySelector('[data-ok]')).focus()
+    }, 60)
     if (inputs[0]) inputs[0].select()
     if (onMount) onMount(box)
     // 名单类输入框按内容撑开（封顶约 12 行）：长名单不必在三行高的小框里上下翻，
@@ -5352,9 +6717,11 @@ function modal({title, desc, html = '', fields = [], ok = '确定', danger = fal
     const hint = () => {
       if (box.animate && !matchMedia('(prefers-reduced-motion: reduce)').matches)
         box.animate([{ transform:'none' }, { transform:'scale(1.012)' }, { transform:'none' }], { duration:280, easing:'cubic-bezier(.16,1,.3,1)' })
-      xBtn.classList.add('hint')
-      clearTimeout(xBtn._t)
-      xBtn._t = setTimeout(() => xBtn.classList.remove('hint'), 900)
+      if (xBtn) {
+        xBtn.classList.add('hint')
+        clearTimeout(xBtn._t)
+        xBtn._t = setTimeout(() => xBtn.classList.remove('hint'), 900)
+      }
     }
     // 内容可滚动时才给头尾描边，避免短内容也画两条线
     const ct = box.querySelector('.ct')
@@ -5369,6 +6736,7 @@ function modal({title, desc, html = '', fields = [], ok = '确定', danger = fal
     const close = v => {
       // 展开中的下拉面板此刻挂在 body 上，bd.remove() 带不走它，会留在页面上
       closeAllSel()
+      clearTimeout(focusTimer)
       const done = () => { bd.remove(); document.removeEventListener('keydown', onKey) }
       bd.classList.add('out')
       bd.addEventListener('animationend', done, { once: true })
@@ -5421,6 +6789,7 @@ function modal({title, desc, html = '', fields = [], ok = '确定', danger = fal
       // 叠了两层时（Tab 能把焦点挪到遮罩后面的按钮上再回车）只有最上面那层响应
       if ([...document.querySelectorAll('.bd:not(.out)')].pop() !== bd) return
       if (e.key === 'Escape') {
+        if (ackOnly) { e.preventDefault(); return }
         if (bd.querySelector('.sel.open')) return closeAllSel()   // 先收起展开的下拉
         if (dirty()) { hint(); return toast('改动还没保存。确定不要了，请点右上角 × 或「取消」', true) }
         return close(null)
@@ -5438,7 +6807,7 @@ function modal({title, desc, html = '', fields = [], ok = '确定', danger = fal
       if (e.key === 'Enter' && !html && document.body.contains(bd)) submit()
     }
     document.addEventListener('keydown', onKey)
-    xBtn.onclick = () => close(null)
+    if (xBtn) xBtn.onclick = () => close(null)
     // noCancel 的弹窗（如抓取诊断）没有取消按钮，不判空的话这里一抛异常，
     // 后面「知道了」的绑定就走不到了 —— 按钮点了没反应，弹窗只能按 Esc 关。
     const cancelBtn = bd.querySelector('[data-x]')
@@ -5451,6 +6820,30 @@ function modal({title, desc, html = '', fields = [], ok = '确定', danger = fal
     bd.addEventListener('pointerdown', e => { downOnBd = e.target === bd })
     bd.addEventListener('click', e => { if (e.target === bd && downOnBd) hint(); downOnBd = false })
   })
+}
+
+async function acknowledgeInsecure(parent, nodes){
+  const count = nodes.filter(n => n.insecure === true).length
+  if (!count) return
+  const wasInert = parent.inert
+  parent.inert = true
+  try {
+    await modal({ title:'跳过证书校验风险', ackOnly:true, ok:'已了解',
+      desc:count > 1 ? '本次保存的 ' + count + ' 个节点启用了“跳过证书校验”。' : '此节点启用了“跳过证书校验”。',
+      html:\`<div class="alert">\${icon('warn')}<span>开启后不会验证服务器证书，可能遭受中间人攻击，导致连接被冒充、数据被窃取或篡改。请确认你了解这一风险。</span></div>\` })
+  } finally { parent.inert = wasInert }
+}
+
+async function confirmBasicCompatibility(parent, nodes){
+  const count = nodes.filter(n => n.compatibilityMode === 'basic').length
+  if (!count) return true
+  const wasInert = parent.inert
+  parent.inert = true
+  try {
+    return !!await modal({ title:'启用基础兼容输出', ok:'启用基础兼容',
+      desc:'原始参数仍保留；此选择影响包含这些节点的所有订阅。',
+      html:\`<div class="alert">\${icon('warn')}<span>无法完整转换时，将省略 ECH、分片、finalmask 等专用参数并下发基础节点。连接效果或域名等隐私保护可能不同，请确认后使用。证书校验等其他设置不会因此改变。</span></div>\` })
+  } finally { parent.inert = wasInert }
 }
 
 /* 表单里的开关（带 id 的 .sw）：点一下翻转 data-on，保存时再读。
@@ -6045,7 +7438,12 @@ const protoName = n => n.type === 'vless' ? ('VLESS ' + (n.security === 'reality
 function ownCardInner(){
   const ow = (OWN && OWN.own) || {}
   let h = \`<div class="ttl">自有节点<span class="sub">自建服务器</span><span class="sp">
-      <button class="sm g" onclick="editOwn(null)">\${icon('plus','s')}添加</button></span></div>
+      <span class="own-add" onpointerenter="hoverOwnAdd(event,this)" onpointerleave="leaveOwnAdd(this)" onfocusout="blurOwnAdd(event,this)">
+        <button type="button" class="g" id="ownadd" aria-haspopup="menu" aria-expanded="false" aria-controls="ownaddmenu" onclick="toggleOwnAdd(this)" onkeydown="keyOwnAdd(event)">\${icon('plus','s')}添加\${icon('down','s')}</button>
+        <span id="ownaddmenu" class="own-add-menu" hidden><span role="menu" aria-label="添加自有节点">
+          <button type="button" role="menuitem" onclick="setOwnAddMenu(false);editOwn(null)">手动添加</button>
+          <button type="button" role="menuitem" onclick="setOwnAddMenu(false);importOwnJSON()">批量导入 JSON</button>
+        </span></span></span></span></div>
     <div class="desc">与机场无关的自建节点，分流策略可以直接指向它们。</div>\`
   if (OWN && !OWN.ok) return h + errHTML(OWN)
   h += '<div class="uplist own">'
@@ -6060,7 +7458,14 @@ function ownCardInner(){
     </div>\`).join('') || blankHTML('server', '还没有自有节点', '支持 VLESS、Hysteria2、Shadowsocks、VMess、AnyTLS，按协议编辑连接参数。')
   h += '</div>'
   const warnings = Object.entries((OWN && OWN.compatibility) || {}).flatMap(([k, items]) => items.map(w => ({...w, name: (ow[k] || {}).name || k})))
-  if (warnings.length) h += '<details class="fg"><summary class="lb" style="cursor:pointer">客户端兼容提示（' + warnings.length + '）</summary><div class="hint">' + warnings.map(w => esc(w.name + ' · ' + ((CLIENTS.find(c => c.k === w.format) || {}).label || w.format) + '：' + w.reason)).join('<br>') + '</div></details>'
+  const groups = new Map()
+  for (const w of warnings) {
+    const key = JSON.stringify([w.name, w.field, w.reason])
+    if (!groups.has(key)) groups.set(key, { ...w, formats:[] })
+    const label = (CLIENTS.find(c => c.k === w.format) || {}).label || w.format
+    if (!groups.get(key).formats.includes(label)) groups.get(key).formats.push(label)
+  }
+  if (groups.size) h += '<details class="fg"><summary class="lb" style="cursor:pointer">客户端兼容提示（' + groups.size + '）</summary><div class="hint">' + [...groups.values()].map(w => '<div class="compat-warning">' + esc(w.name + ' · ' + w.formats.join(' / ') + '：' + w.reason) + '</div>').join('') + '</div></details>'
   return h
 }
 
@@ -7176,6 +8581,16 @@ window.editSettings = async () => {
   toast('已保存'); dash(true)
 }
 
+${"const parseOwnJSON = (() => {\n" + [
+  'const OWN_TYPES=' + JSON.stringify(OWN_TYPES), 'const OWN_NETS=' + JSON.stringify(OWN_NETS), 'const OWN_SS_METHODS=' + JSON.stringify(OWN_SS_METHODS),
+  'const BAD_KEYS=new Set(' + JSON.stringify([...BAD_KEYS]) + ')', 'const SB_UTLS=new Set(' + JSON.stringify([...SB_UTLS]) + ')', 'const SB_VMESS=new Set(' + JSON.stringify([...SB_VMESS]) + ')',
+  'const IMPORT_VMESS_FIELDS=new Set(' + JSON.stringify([...IMPORT_VMESS_FIELDS]) + ')', 'const IMPORT_PLUGIN_FIELDS=new Set(' + JSON.stringify([...IMPORT_PLUGIN_FIELDS]) + ')',
+  'const IMPORT_QUERY_COMMON=' + JSON.stringify(IMPORT_QUERY_COMMON), 'const IMPORT_QUERY_BYTYPE=' + JSON.stringify(IMPORT_QUERY_BYTYPE),
+  'const reservedImportQuery=' + reservedImportQuery.toString(),
+  ...[bareHost, normalizeWsPath, b64uDecode, ownSecurity, validateImportExtras, validateClientOptions, compactClientOptions, normalizeOwnNode, sbPorts, sbPlugin, parseOwnJSON].map(fn => fn.toString()),
+  'return parseOwnJSON'
+].join(';\n') + '\n})();'}
+${"(" + installOwnJSONUI.toString() + ")();"}
 ${"(" + installOwnEditor.toString().replace(/\n  /g, '\n') + ")();"}
 ${"(" + installLocalFetchClient.toString() + ")();"}
 
@@ -7193,8 +8608,15 @@ window.delOwn = async (key) => {
   toast('已删除'); dash(true)
 }
 window.copyOwnLink = async (key, b) => {
-  const link = ((OWN && OWN.links) || {})[key]
-  if (!link) return toast('这个节点生成不了分享链接', true)
+  let link = ((OWN && OWN.links) || {})[key]
+  if (!link) {
+    const basic = ((OWN && OWN.basicLinks) || {})[key]
+    if (!basic) return toast(((OWN && OWN.linkErrors) || {})[key] || '这个节点生成不了分享链接，请检查节点配置。', true)
+    if (!await modal({ title:'复制基础节点链接', ok:'复制基础链接',
+      desc:'原节点的客户端专用参数会保留，不会从本站删除。',
+      html:\`<div class="alert">\${icon('warn')}<span>VLESS 的 ECH 配置会通过 ech 参数保留。无法表达的分片、finalmask、旧版 echForceQuery 等专用设置仍可能省略，连接效果或隐私保护可能不同。确认后复制可表达的节点配置，原参数不会删除。</span></div>\` })) return
+    link = basic
+  }
   if (!await copyText(link)) return toast('复制失败', true)
   b.innerHTML = icon('check'); b.classList.add('on')
   toast('分享链接已复制 —— 里面有节点密钥，别发到公开场合')
@@ -7468,6 +8890,7 @@ function bindUpMode(b, snapAt){
           <p><b>网络信息：</b>订阅站点可以看到浏览器当前的出口 IP（使用代理时为代理出口）及请求信息。</p>
           <p><b>敏感凭据：</b>订阅链接通常包含访问令牌，返回的节点可能包含密码。不要将它们交给陌生中转站或公开分享。</p>
           <p><b>保存位置：</b>下载结果和订阅链接仍会通过 HTTPS 上传本站，保存到你自己的 Cloudflare KV，并非仅留在本机。</p>
+          <p><b>拉取方式：</b>当前网络请求订阅 → 内容返回浏览器 → 上传 Worker → 保存到 KV</p>
           <p>确认已了解上述风险，请点击「确定」继续；取消不会切换更新方式，也不会发起下载。</p>\` })
       if (confirmed && b.isConnected) {
         allowLocal = true

@@ -2094,8 +2094,8 @@ sec('50. Shadowrocket 原生 conf')
 const uiBlocks = () => {
   const ui = T.adminHTML(true, true)
   const js = ui.slice(ui.indexOf('<script>'), ui.lastIndexOf('</script>'))
-  const marks = [...js.matchAll(/\n(?:window\.(\w+) = async|async function (\w+)|function (\w+))/g)]
-    .map(m => ({ i: m.index, name: m[1] || m[2] || m[3] }))
+  const marks = [...js.matchAll(/\n(?:window\.(\w+) = async|async function (\w+)|function (\w+)|\(function (\w+))/g)]
+    .map(m => ({ i: m.index, name: m[1] || m[2] || m[3] || m[4] }))
   return marks.map((m, k) => ({ name: m.name, body: js.slice(m.i, k + 1 < marks.length ? marks[k + 1].i : undefined) }))
     .filter(b => /modal\(\{/.test(b.body))
 }

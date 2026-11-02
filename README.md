@@ -10,7 +10,7 @@
 
 | 功能 | 当前支持 |
 |------|----------|
-| 自有节点 | VLESS、Hysteria2、Shadowsocks、VMess、AnyTLS 的可视化添加、编辑与分享链接导入 |
+| 自有节点 | VLESS、Hysteria2、Shadowsocks、VMess、AnyTLS 的可视化编辑、分享链接及 JSON / Clash YAML 导入 |
 | 订阅源更新 | 自动更新、手动快照、使用本地网络拉取；添加与编辑提供相同选项 |
 | 本地网络拉取 | 浏览器直接下载上游内容，再上传本站保存快照；不安装扩展或本机助手 |
 | 表单布局 | 桌面成对字段对齐，手机自动换行；勾选项适配明暗主题、键盘和文字点击 |
@@ -138,6 +138,34 @@ KV_NAMESPACE_ID=... bash deploy.sh    # 明确指定 KV namespace
 
 自有节点的高级字段与客户端格式兼容说明见[进阶配置 / 平台说明](#进阶配置--平台说明)。
 
+### JSON 编辑与批量导入
+
+自有节点右上角使用同一个“添加 ▾”按钮：电脑支持鼠标悬停或点击展开，手机点击展开，可选“手动添加”或“批量导入 JSON”。添加、编辑单个节点时，弹窗左下角的“编辑 JSON”会加载当前表单草稿；解析后只填回表单，仍需点击“保存”才会写入。
+
+自动识别编辑器 JSON 对象 / 数组、Clash / Mihomo JSON 或常见 YAML、Xray 与 sing-box 出站节点、`outbounds` / `proxies` 片段及完整配置。无需补齐完整外壳；结构末尾的多余逗号会安全处理，字符串里的逗号不改动。输入框上方按格式列出 SS、VLESS、VMess、HY2、AnyTLS 的只读结构示例，仅展示对应内核真实支持的组合。完整配置只提取节点，不导入路由、DNS 或入站设置。批量导入只新增节点，不覆盖现有节点；重名会提示修改，不会自动替换。
+
+每批最多 100 个节点、256 KiB UTF-8、16 层嵌套。解析和预览在浏览器本地进行，不请求上游；批量保存沿用节点保存接口，一批写入一次 `nodes`，不是每个节点各写一次。保存和界面刷新仍占用正常的 Worker 请求与 KV 读写额度，不需要付费功能。
+
+基础字段映射到当前五协议编辑器，已识别的 ECH、Xray `finalmask` 和 sing-box TLS 分片字段原样保存在“客户端专用参数”中。sing-box 分片参数会随 sing-box 完整配置下发；不能等效表达这些参数的输出格式会提示并剔除整条节点及其分组引用，而不是去掉参数后强行连接。未知或不支持的连接字段仍按节点序号和原始路径报错，整批不保存。已关闭的复用、导出器冗余默认字段，以及非代理出站会明确列为未导入项。
+
+Clash YAML 使用本地安全子集解析器，支持常见流式 / 块式节点、嵌套、引号和注释；多个单行节点可一起粘贴，兼容列表整体缩进和复制时首行缩进缺失。不支持标签、锚点、别名、合并、多文档及多行标量。不会执行输入内容，也不调用第三方转换服务。
+
+图形编辑中，每次勾选开启“跳过证书校验”就立即弹出站内风险告知，说明可能遭受中间人攻击；仅有“已了解”按钮。取消勾选不提醒，再次勾选会再次提醒，同一草稿确认后保存不重复弹窗。JSON 或分享链接解析填回时若启用了跳过校验也会告知；批量导入在确认保存前统一提示一次。没有“不再提示”选项。
+
+客户端专用参数无需删除才能复制节点：复制按钮会在必要时提供“复制基础链接”确认，说明通用 URI 无法携带的分片、旧版 ECH 查询策略等选项可能影响连接或隐私。确认后只复制基础配置，原节点的完整参数仍保留。订阅输出仍按格式兼容性处理，不会自动改成缺少专用参数的订阅。显式关闭的分片标志、空 ECH 和空 finalmask 列表等不生效默认值不再生成专用参数块；现有节点不会自动迁移。
+
+VLESS 分享链接中的 ECH 使用 v2rayN 支持的 `ech=` 参数。JSON 导入的 `tlsSettings.echConfigList` 会作为完整字符串编码一次后放入该参数，固定配置与 DNS 查询字符串都保留；“复制基础链接”也不会丢掉可以表达的 ECH。与分享链接导入的 `ech` 内容一致时只输出一份，若两处值冲突则明确报错，不静默覆盖。旧版 `echForceQuery` 策略和 `finalmask` 仍没有已验证的等价 URI 表达，会单独提示，不代表整个链接已无损转换。
+
+Clash Reality 的 `reality-opts.support-x25519mlkem768` 支持布尔值导入、编辑与再次导出，缺省记录不自动补值。图形表单提供“客户端默认 / 允许指纹提供该能力 / 移除该能力兼容旧服务端”三态。它是 Mihomo 的指纹密钥交换能力开关，不是强制启用后量子，也不是 Xray 的 `mldsa65Verify` 签名验证参数。分享链接保留标准 Reality 公钥、ShortId、SNI、指纹与 Flow；Xray 等目标内核自行协商，不能保证该 Mihomo 开关跨内核、跨版本完全等效。
+
+### 基础兼容输出
+
+节点编辑的“高级配置”中，带客户端专用参数的节点可选择“基础兼容输出”。默认关闭：无法完整转换的格式仍不下发该节点。开启前会说明可能省略的参数、连接与隐私影响，确认后才启用；这项选择影响包含该节点的所有订阅，而不只是当前设备。
+
+开启后，仅省略当前格式不能表达的 ECH、`finalmask` 或 TLS 分片等专用设置，其余基础节点仍正常下发；证书校验、VLESS Encryption 和传输支持范围等其他限制不变。完整原参数保存在节点中，关闭即可恢复严格输出。不会自动修改已有节点，也不会自动为导入的外部配置开启。节点 JSON 使用 `compatibilityMode: "basic"` 或 `"strict"` 表示该选择；导入显式 `basic` 的 JSON 时仍需在界面确认。
+
+可准确转换的固定 ECHConfigList 会直接映射到 Clash / Mihomo 的 `ech-opts` 和兼容的 sing-box `tls.ech`，无需开启基础兼容模式。Xray 指定 DNS 解析器的动态 ECH、非空 `echForceQuery` 及 `finalmask` 等尚无等价映射的配置不会假装无损转换。管理页会合并相同格式警告，订阅预览仍按实际输出列出省略项。
+
 ## 安全
 
 管理端开在公网上，订阅 token 持有者可以取得该配置视图中下发的节点凭据，因此需要保护以下信息：
@@ -173,6 +201,8 @@ KV_NAMESPACE_ID=... bash deploy.sh    # 明确指定 KV namespace
 字段在保存、重新打开和支持该字段的订阅格式中保持一致。VMess 按 [v2rayN 官方分享格式](https://github.com/2dust/v2rayN/wiki/Description-of-VMess-share-link)识别 `insecure`、`vcn`、`pcs`；AnyTLS 省略端口时使用官方默认的 443。未知附加字段不再阻断整条链接，会保留在「导入扩展字段」中、随保存和再次编辑保留，并在完整配置兼容提示中列出。原始分享链接导出保留这些扩展参数；尚未实现的连接参数不代表已生效，请按提示选择适合的客户端。无效必填字段、非法安全模式和不完整认证仍会明确报错，不会靠默认选项悄悄改写。旧 VLESS / Hysteria2 记录不在读取或保存其他节点时迁移；原有节点标识和订阅 token 不变。
 
 VLESS 的协议加密字段是 `encryption`，VMess 的加密方式来自 `scy`，均与传输路径分开保存。WebSocket 路径缺少前导 `/` 时，按 Xray 的规则补齐；路径内已有的百分号编码不做二次解码。
+
+已知限制：Xray WebSocket 路径中的 `?ed=数字` 会拆成独立的 Early Data 字段保存，Clash / sing-box 完整配置仍会携带；当前通用分享链接不会把它还原成路径里的 `?ed=`。这通常影响首包提前发送优化，不代表 ECH 或其他路径参数应被删除，也不保证所有客户端行为一致。
 
 证书校验域名 `vcn` 和完整证书 SHA256 指纹 `pcs` / `pinSHA256` 可在高级配置中编辑，并映射到 Clash 的 `name-cert-verify` / `fingerprint`。完整证书指纹不能当成公钥指纹；兼容的 sing-box 1.12–1.14 无法表达时会提示并剔除该节点，而不是去掉证书校验强行连接。
 
@@ -262,6 +292,12 @@ VLESS 的协议加密字段是 `encryption`，VMess 的加密方式来自 `scy`�
 node dev/server.mjs                             # 本地预览 http://localhost:8787/admin，密码 devpassword
 npm install --prefix test && node test/run.cjs  # 单元与接口测试
 node --test test/own-protocols.cjs              # 自有节点多协议保存、导入、输出与兼容回归
+node --test test/own-json.cjs                   # 本站 / Clash / Xray JSON 识别与安全边界回归
+node --test test/adaptive-import.cjs test/client-options.cjs # 配置片段、Clash YAML、sing-box 与专用参数回归
+node --test test/yaml-multi.cjs                 # 多节点单行 YAML 缩进与安全边界回归
+node --test test/compatibility-mode.cjs test/ech-mapping.cjs # 兼容模式、ECH 映射及保密边界回归
+node --test test/ech-share.cjs                  # VLESS ECH 双导入路径、编码与只读分享回归
+node --test test/reality-pq.cjs                 # Reality 能力开关、三态及跨格式身份保留回归
 node --test test/import-compatibility.cjs       # 官方分享链接字段与扩展参数导入回归
 node --test test/encryption-path.cjs            # 加密字段、路径编码与 WebSocket 路径归一回归
 node --test test/security-hardening.cjs         # HTTPS、权威状态故障关闭与诊断最小输出回归
@@ -278,7 +314,7 @@ bash deploy.sh                                  # 部署
 
 本机开发页面允许使用 localhost 或 `127.0.0.1` 的 HTTP 测试订阅，线上部署仍要求 HTTPS。本地模式回归使用虚构内容和替代网络函数，不需要真实订阅。现有浏览器端到端测试需要 Chrome；没有实际执行时，不应把语法检查或离线测试写成端到端通过。
 
-GitHub Actions 运行单元与接口测试、五份协议/安全/本地网络回归、已有浏览器端到端测试，并检查 `docs/demo.html` 与源码同步。README 中的截图不是每次代码更新都自动重拍。
+GitHub Actions 运行单元与接口测试、协议 / JSON / 安全 / 本地网络回归、已有浏览器端到端测试，并检查 `docs/demo.html` 与源码同步。README 中的截图不是每次代码更新都自动重拍。
 
 管理端前端整个嵌在 `adminHTML()` 的模板字符串里：前端代码里的反斜杠、反引号、`${` 都要转义（`\\n`、`` \` ``、`\${`），写成单个反斜杠会被模板提前吃掉 —— `run.cjs` 会实际编译前端脚本和其中的正则来把关。
 
