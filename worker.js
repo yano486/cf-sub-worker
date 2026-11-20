@@ -4787,10 +4787,122 @@ function installLocalFetchClient() {
   }
 }
 
+function ownHeaderRows(n) {
+  const rows = Object.entries(n.headers || {}).map(([name, value]) => ({ name, value }))
+  if (n.host && !rows.some(row => row.name.toLowerCase() === 'host')) rows.unshift({ name: 'Host', value: n.host })
+  return rows
+}
+
+function collectOwnHeaders(rows, host = '') {
+  const bad = (err, row = 0) => ({ err, row })
+  if (!Array.isArray(rows) || rows.length > 31) return bad('最多设置 30 个其他请求头，另可设置 Host')
+  const headers = Object.create(null), names = new Set()
+  for (const [i, row] of rows.entries()) {
+    const name = row.name, value = row.value
+    if (name === '' && value === '') continue
+    if (typeof name !== 'string' || !/^[!#$%&'*+.^_`|~\w-]+$/.test(name) || ['__proto__', 'constructor', 'prototype'].includes(name)) return bad('请选择请求头名称，或填写合法的自定义名称', i)
+    const lower = name.toLowerCase()
+    if (names.has(lower)) return bad('请求头名称重复（不区分大小写），请删除重复行', i)
+    names.add(lower)
+    if (typeof value !== 'string' || value.length > 4096 || /[\r\n\x00]/.test(value)) return bad('请求头内容不能包含换行、空字符或超过 4096 个字符', i)
+    if (lower === 'host') {
+      if (host && host !== value) return bad('Host 与原有 Host 字段冲突，请修改 Host 行以确认采用的值', i)
+      host = value
+      if (value) headers.Host = value
+    } else headers[name] = value
+  }
+  // Host already has a separate field; do not make a valid 30-header node exceed its stored limit.
+  if (Object.keys(headers).length > 30 && Object.hasOwn(headers, 'Host')) delete headers.Host
+  if (Object.keys(headers).length > 30) return bad('最多设置 30 个其他请求头，另可设置 Host')
+  return { headers, host }
+}
+
+// The editor extracts ECH for display; storage and kernel conversion rules stay unchanged.
+function ownECHState(n) {
+  const clone = value => value === undefined ? undefined : JSON.parse(JSON.stringify(value))
+  const object = value => value && typeof value === 'object' && !Array.isArray(value)
+  const bad = (err, field) => ({ err, field })
+  const extras = clone(n.importExtras), clientOptions = clone(n.clientOptions)
+  const values = [], queryKeys = [], vmessKeys = []
+  let hasConfig = false
+  if (extras !== undefined) {
+    if (!object(extras)) return bad('导入扩展字段必须是 JSON 对象', 'oimportextras')
+    if (extras.query !== undefined) {
+      if (!Array.isArray(extras.query) || extras.query.some(pair => !Array.isArray(pair) || pair.length !== 2 || pair.some(v => typeof v !== 'string'))) return bad('链接扩展参数必须是名称与字符串值组成的数组', 'oimportextras')
+      extras.query = extras.query.filter(([key, value]) => {
+        if (key.toLowerCase() !== 'ech') return true
+        queryKeys.push(key); values.push(value); return false
+      })
+      if (!extras.query.length) delete extras.query
+    }
+    if (extras.vmess !== undefined) {
+      if (!object(extras.vmess)) return bad('VMess 扩展字段必须是 JSON 对象', 'oimportextras')
+      for (const key of Object.keys(extras.vmess)) if (key.toLowerCase() === 'ech') {
+        if (typeof extras.vmess[key] !== 'string') return bad('VMess ECH 必须是字符串', 'oimportextras')
+        vmessKeys.push(key); values.push(extras.vmess[key]); delete extras.vmess[key]
+      }
+      if (!Object.keys(extras.vmess).length) delete extras.vmess
+    }
+  }
+  if (clientOptions !== undefined) {
+    if (!object(clientOptions)) return bad('客户端专用参数必须是 JSON 对象', 'oclientoptions')
+    if (clientOptions.xray !== undefined) {
+      if (!object(clientOptions.xray)) return bad('Xray 专用参数必须是 JSON 对象', 'oclientoptions')
+      const tls = clientOptions.xray.tlsSettings
+      if (tls !== undefined) {
+        if (!object(tls)) return bad('Xray TLS 参数必须是 JSON 对象', 'oclientoptions')
+        if (tls.echConfigList !== undefined) {
+          if (typeof tls.echConfigList !== 'string') return bad('ECH 配置必须是字符串', 'oclientoptions')
+          hasConfig = true; values.unshift(tls.echConfigList); delete tls.echConfigList
+        }
+        if (!Object.keys(tls).length) delete clientOptions.xray.tlsSettings
+      }
+      if (!Object.keys(clientOptions.xray).length) delete clientOptions.xray
+    }
+  }
+  const unique = [...new Set(values)]
+  return { value: unique[0] || '', values: unique, conflict: unique.length > 1, hasConfig, queryKeys, vmessKeys,
+    extras: extras && Object.keys(extras).length ? extras : undefined,
+    clientOptions: clientOptions && Object.keys(clientOptions).length ? clientOptions : undefined }
+}
+
+function applyOwnECH(draft, original, value, acknowledged = false) {
+  const bad = err => ({ err, field: 'oech' })
+  if (typeof value !== 'string' || value.length > 32768 || /[\x00-\x1f\x7f]/.test(value)) return bad('ECH 配置必须是不超过 32768 个字符的单行文本')
+  try { encodeURIComponent(value) } catch (error) { return bad('ECH 配置包含无法编码的字符') }
+  if (original.conflict && !acknowledged) return bad('已有多个不同的 ECH 配置，请修改或清空独立 ECH 输入框以确认采用的值')
+  const current = ownECHState(draft)
+  if (current.err) return current
+  if (current.values.some(v => v !== value)) return bad('高级 JSON 中的 ECH 与独立输入框不一致，请统一后再保存')
+  const n = { ...draft }
+  delete n.importExtras; delete n.clientOptions
+  if (current.extras) n.importExtras = current.extras
+  if (current.clientOptions) n.clientOptions = current.clientOptions
+  if (value) {
+    const config = original.hasConfig || current.hasConfig
+    const vmess = original.vmessKeys.length || current.vmessKeys.length
+    const query = original.queryKeys.length || current.queryKeys.length || !config && !vmess
+    if (config) {
+      n.clientOptions = n.clientOptions || {}
+      n.clientOptions.xray = n.clientOptions.xray || {}
+      n.clientOptions.xray.tlsSettings = n.clientOptions.xray.tlsSettings || {}
+      n.clientOptions.xray.tlsSettings.echConfigList = value
+    }
+    if (query || vmess) n.importExtras = n.importExtras || {}
+    if (query) n.importExtras.query = [...(n.importExtras.query || []), ['ech', value]]
+    if (vmess) n.importExtras.vmess = { ...(n.importExtras.vmess || {}), ech: value }
+  }
+  return { node: n }
+}
+
 // Installed into the existing page scope; keeping this as JS avoids nested-template escaping bugs.
 function installOwnEditor() {
   const types = [{ v: 'vless', label: 'VLESS' }, { v: 'hysteria2', label: 'Hysteria2' }, { v: 'ss', label: 'Shadowsocks' }, { v: 'vmess', label: 'VMess' }, { v: 'anytls', label: 'AnyTLS' }, { v: 'tuic', label: 'TUIC v5' }]
   const networks = [{ v: 'tcp', label: 'TCP / RAW' }, {v:'ws',label:'WebSocket + TLS（可套 CDN）'}, { v: 'httpupgrade', label: 'HTTPUpgrade' }, { v: 'grpc', label: 'gRPC' }, { v: 'h2', label: 'HTTP/2' }, { v: 'http', label: 'TCP + HTTP 伪装' }, { v: 'xhttp', label: 'XHTTP' }]
+  const alpnOptions = [{v:'',label:'默认'}, ...['h3','h2','http/1.1','h3,h2','h2,http/1.1','h3,h2,http/1.1'].map(v => ({v,label:v})), {v:'custom',label:'自定义'}]
+  const alpnPreset = values => alpnOptions.some(o => o.v !== 'custom' && o.v === values.join(',')) ? values.join(',') : 'custom'
+  const headerNames = ['Host','User-Agent','Origin','Referer','Authorization','Cookie','Accept','Accept-Language','Cache-Control']
+  const headerOptions = [...headerNames.map(v => ({v,label:v})), {v:'custom',label:'自定义名称'}]
   const defaults = type => ({ name: '', type, s: '', p: 443, u: '', sni: '', security: type === 'ss' ? 'none' : type === 'vless' ? 'reality' : 'tls', net: 'tcp', packetEncoding: type === 'vless' ? 'xudp' : '', flow: type === 'vless' ? 'xtls-rprx-vision' : '', cipher: type === 'ss' ? 'aes-128-gcm' : 'auto', fp: 'chrome', alpn: type === 'tuic' ? ['h3'] : [], insecure: false, udp: true, path: '/', host: '', pk: '', sid: '', plugin: '', pluginOpts: {}, obfs: '', opwd: '', ports: '' })
   window.editOwn = async (key) => {
     const isNew = key === null, ow = (OWN && OWN.own) || {}
@@ -4820,24 +4932,24 @@ function installOwnEditor() {
       <div id="ftls">${input('osni', 'SNI / TLS 服务器名称', n.sni)}</div>
       <div id="ftransport">${select('onet', '传输方式', networks, n.net)}
         <div id="fr"><div class="own-fields">${input('opk', 'Reality 公钥', n.pk)}${input('osid', 'ShortId', n.sid)}</div>${select('orealitypq', 'Reality 密钥交换能力（Mihomo）', [{v:'',label:'保持客户端默认'},{v:'1',label:'允许指纹提供 X25519MLKEM768'},{v:'0',label:'移除 X25519MLKEM768（兼容旧服务端）'}], n.realityPQ === undefined ? '' : n.realityPQ ? '1' : '0')}<div class="hint">这是 Mihomo 的指纹能力开关，不是强制启用后量子。Xray 等内核通常自行协商；分享保留公钥、ShortId、SNI 和指纹，请核对客户端内核版本。</div></div>
-        <div id="fw"><div class="own-fields">${input('opath', '传输路径', n.path || '/')}${input('ohost', 'Host（留空使用 SNI）', n.host)}</div></div>
+        <div id="fw"><div class="own-fields" id="ownpathfields">${input('opath', '传输路径', n.path || '/')}<div id="fhost">${input('ohost', 'Host（留空使用 SNI）', n.host)}</div></div></div>
         <div id="fgrpc">${input('ogrpc', 'gRPC ServiceName', n.serviceName)}</div>
         <div id="fxmode">${select('omode', 'XHTTP 模式', ['auto','packet-up','stream-up','stream-one'].map(v => ({v,label:v})), n.mode || 'auto')}</div>
       </div>
       <details class="fg" id="ownadvanced" ${!isNew ? 'open' : ''}><summary class="lb" style="cursor:pointer;padding:8px 0">高级配置</summary>
         <div class="hint" id="ohelp">兼容提示：不支持的字段会保留在本站，并在订阅预览标明；不会伪装成其他协议。</div>
-        <div id="fvtls"><div id="ffp">${select('ofp', '客户端指纹', ['chrome','chrome_psk','chrome_psk_shuffle','chrome_padding_psk_shuffle','chrome_pq','chrome_pq_psk','firefox','edge','safari','360','qq','ios','android','random','randomized','none'].map(v => ({v,label:v})), n.fp || 'none')}</div>${input('oalpn', 'ALPN（逗号分隔）', (n.alpn || []).join(','))}${toggle('oinsecure', '跳过证书校验（不推荐）', n.insecure)}${input('overifyname', '证书校验域名（vcn，可选）', n.verifyName)}${input('ocertsha256', '证书 SHA256 指纹（pcs / pinSHA256，可选）', n.certSha256)}<div class="hint">这是完整证书的 SHA256，不是公钥指纹。Clash 支持；旧版 sing-box 无法表示时不会弱化校验强行下发。</div></div>
+        <div id="fvtls"><div id="ffp">${select('ofp', '客户端指纹', ['chrome','chrome_psk','chrome_psk_shuffle','chrome_padding_psk_shuffle','chrome_pq','chrome_pq_psk','firefox','edge','safari','360','qq','ios','android','random','randomized','none'].map(v => ({v,label:v})), n.fp || 'none')}</div>${select('oalpnpreset', 'ALPN', alpnOptions, alpnPreset(n.alpn || []))}<div id="falpncustom" ${alpnPreset(n.alpn || []) === 'custom' ? '' : 'hidden'}>${input('oalpn', '自定义 ALPN（逗号分隔，顺序保留）', (n.alpn || []).join(','))}</div><div class="hint" id="oalpnhint"></div><div id="fech">${input('oech', 'ECH 配置（可选，直接填写内容）')}<div class="hint" id="oechhint">原样保留完整 ECH 内容。分享和内核支持情况仍以兼容提示为准；填写此项不代表所有客户端都能启用 ECH。</div><div class="hint" id="oechconflict" hidden>已有多个不同的 ECH 配置，请修改或清空此框，明确选择采用的值后再保存。</div></div>${toggle('oinsecure', '跳过证书校验（不推荐）', n.insecure)}${input('overifyname', '证书校验域名（vcn，可选）', n.verifyName)}${input('ocertsha256', '证书 SHA256 指纹（pcs / pinSHA256，可选）', n.certSha256)}<div class="hint">这是完整证书的 SHA256，不是公钥指纹。Clash 支持；旧版 sing-box 无法表示时不会弱化校验强行下发。</div></div>
         ${toggle('oudp', '启用 UDP', n.udp !== false)}
         <div id="fvless">${input('oencryption', 'VLESS Encryption（禁用填 none）', n.encryption || 'none')}${select('oflow', 'Flow 流控', [{v:'',label:'不启用 Flow'},{v:'xtls-rprx-vision',label:'xtls-rprx-vision'},{v:'xtls-rprx-vision-udp443',label:'xtls-rprx-vision-udp443'}], n.flow || '')}</div>
         <div id="fpacket">${select('opacket', 'UDP 包编码', [{v:'',label:'默认 / 原始'},{v:'xudp',label:'xudp'},{v:'packetaddr',label:'packetaddr'}], n.packetEncoding || '')}</div>
         <div id="fvmess">${input('oalter', 'AlterID（推荐 0 / AEAD）', n.alterId ?? 0, numeric)}</div>
-        <div id="fwsadvanced">${input('oearly', 'WebSocket Early Data（字节，可留空）', n.earlyData, numeric)}${input('oearlyheader', 'Early Data 请求头', n.earlyDataHeader || 'Sec-WebSocket-Protocol')}<div class="fg"><label class="lb" for="oheaders">其他 WS 请求头（可选 JSON）</label><textarea id="oheaders" placeholder='{"X-Example":"value"}'>${esc(JSON.stringify(n.headers || {}))}</textarea></div></div>
+        <div id="fwsadvanced">${input('oearly', 'WebSocket Early Data（字节，可留空）', n.earlyData, numeric)}${input('oearlyheader', 'Early Data 请求头', n.earlyDataHeader || 'Sec-WebSocket-Protocol')}<div class="fg" id="oheaders"><label class="lb">WS / HTTPUpgrade 请求头</label><div id="ownheaderrows"></div><button type="button" class="g sm" id="ownheaderadd">添加请求头</button><div class="hint">支持同时设置 Host、User-Agent 等请求头，也可自定义名称。Host 留空使用默认值；任意请求头请使用支持的完整订阅格式，不是所有分享链接都能携带。</div></div></div>
         <div id="fh"><div class="own-fields">${input('oports', 'HY2 端口跳跃（如 443,20000-20100）', n.ports)}${input('ohop', '跳跃间隔（秒，可留空）', n.hopInterval, numeric)}</div><div class="own-fields">${input('oup', '上行带宽（Mbps）', n.upMbps, 'type="number" min="0.001" step="any"')}${input('odown', '下行带宽（Mbps）', n.downMbps, 'type="number" min="0.001" step="any"')}</div>${select('oobfs', '混淆类型', [{v:'',label:'不启用混淆'},{v:'salamander',label:'Salamander'}], n.obfs || '')}${input('oopwd', '混淆密码', n.opwd)}</div>
         <div id="fss">${toggle('ouot', '启用 UDP-over-TCP', n.uot)}${select('ouotversion', 'UDP-over-TCP 版本', [{v:'2',label:'2'},{v:'1',label:'1'}], String(n.uotVersion || 2))}${select('oplugin', 'SS 插件', [{v:'',label:'不使用插件'},{v:'obfs',label:'simple-obfs'},{v:'v2ray-plugin',label:'v2ray-plugin'}], n.plugin || '')}<div id="fplugin">${select('opluginmode', '插件模式', [{v:'websocket',label:'WebSocket（v2ray-plugin）'},{v:'http',label:'HTTP（obfs）'},{v:'tls',label:'TLS（obfs）'}], n.pluginOpts?.mode || (n.plugin === 'obfs' ? 'http' : 'websocket'))}${input('opluginhost', '插件 Host', n.pluginOpts?.host)}${input('opluginpath', '插件路径', n.pluginOpts?.path || '/')}${toggle('oplugintls', '插件 TLS', String(n.pluginOpts?.tls) === 'true')}${toggle('opluginmux', '插件 Mux', String(n.pluginOpts?.mux) === 'true')}</div></div>
         <div id="fanytls"><div class="own-fields">${input('oidlecheck', '空闲会话检查间隔（秒）', n.idleCheck, numeric)}${input('oidletimeout', '空闲会话超时（秒）', n.idleTimeout, numeric)}</div>${input('ominidle', '最少保留的空闲会话数量', n.minIdle, numeric)}</div>
         <div id="ftuic"><div class="own-fields">${select('otuiccongestion', '拥塞控制', [{v:'',label:'客户端默认'}, ...['cubic','new_reno','bbr'].map(v => ({v,label:v}))], n.congestionControl || '')}${select('otuicrelay', 'UDP 中继模式', [{v:'',label:'客户端默认'}, {v:'native',label:'native（原生 UDP）'}, {v:'quic',label:'quic（QUIC 流）'}], n.udpRelayMode || '')}</div>${input('otuicheartbeat', '心跳间隔（毫秒，可留空）', n.heartbeatInterval, 'type="number" min="1" max="86400000" step="1"')}<div class="own-fields">${select('otuicrtt', '0-RTT 握手', [{v:'',label:'客户端默认'}, {v:'0',label:'关闭'}, {v:'1',label:'开启（有重放风险）'}], n.zeroRtt === undefined ? '' : n.zeroRtt ? '1' : '0')}${select('otuicsni', '发送 SNI', [{v:'',label:'客户端默认'}, {v:'0',label:'正常发送'}, {v:'1',label:'禁用 SNI'}], n.disableSni === undefined ? '' : n.disableSni ? '1' : '0')}</div><div class="hint">TUIC v5 使用 UUID + 密码，不支持 v4 token。0-RTT 可能增加重放风险，默认不主动开启。Mihomo 禁用 SNI 时会同时跳过证书校验：若当前仍要求校验证书，Clash 格式不会下发该节点，不能自动降低安全要求。通用链接未必能携带这些高级参数。</div></div>
         <div class="fg" id="fimportextras" ${n.importExtras ? '' : 'hidden'}><label class="lb" for="oimportextras">导入扩展字段（JSON，原样保留）</label><textarea id="oimportextras" spellcheck="false">${esc(JSON.stringify(n.importExtras || {}))}</textarea><div class="hint">这些字段不会导致整条链接被拒绝。当前完整配置未必支持，请核对兼容提示；分享链接会尽量原样保留。字段可能包含敏感信息，请勿截图外发。</div></div>
-        <div class="fg" id="fclientoptions" ${n.clientOptions ? '' : 'hidden'}><label class="lb" for="oclientoptions">客户端专用参数（JSON，原样保留）</label><textarea id="oclientoptions" spellcheck="false">${esc(JSON.stringify(n.clientOptions || {}))}</textarea><div class="hint">保留 ECH、分片等原参数。无法等效转换的格式默认不下发；可在下方明确确认基础兼容输出，下发可表达的基础配置。</div></div>
+        <div class="fg" id="fclientoptions" ${n.clientOptions ? '' : 'hidden'}><label class="lb" for="oclientoptions">客户端专用参数（JSON，原样保留）</label><textarea id="oclientoptions" spellcheck="false">${esc(JSON.stringify(n.clientOptions || {}))}</textarea><div class="hint">保留 ECH 查询策略、分片等原参数；ECH 内容在独立输入框编辑。无法等效转换的格式默认不下发；可在下方明确确认基础兼容输出，下发可表达的基础配置。</div></div>
         <div class="fg" id="fcompatmode" ${n.clientOptions || n.type === 'tuic' ? '' : 'hidden'}>${toggle('obasic', '基础兼容输出（需确认）', n.compatibilityMode === 'basic')}<div class="hint">仅在无法完整转换的格式中省略专用参数，下发基础节点；原参数保留。默认关闭，可随时恢复。此选择影响包含该节点的所有订阅。</div></div>
       </details>
       ${isNew ? '' : `<div class="fg"><label class="lb">节点标识（自动生成，不可改）</label><input class="mono" value="${esc(key)}" disabled></div>`}`
@@ -4869,11 +4981,71 @@ function installOwnEditor() {
         if (opt && pick(id) !== String(value)) opt.click()
       }
       let active = n.type, filling = false, compatibilityExplicit = n.compatibilityMode !== undefined
+      let echState, echChanged = false, headerIndex = 0
+      const loadECH = data => {
+        echState = ownECHState(data); echChanged = false
+        get('oech').value = echState.value || ''
+        get('oechconflict').hidden = !echState.conflict
+        get('oimportextras').value = JSON.stringify((echState.err ? data.importExtras : echState.extras) || {})
+        get('fimportextras').hidden = !(echState.err ? data.importExtras : echState.extras)
+        get('oclientoptions').value = JSON.stringify((echState.err ? data.clientOptions : echState.clientOptions) || {})
+        get('fclientoptions').hidden = !(echState.err ? data.clientOptions : echState.clientOptions)
+      }
+      get('oech').addEventListener('input', () => { echChanged = true; get('oechconflict').hidden = true })
+      const headerRows = () => [...get('ownheaderrows').querySelectorAll('.own-header-row')]
+      const headerName = row => row.querySelector('.sel').dataset.v === 'custom' ? row.querySelector('.own-header-custom').value : row.querySelector('.sel').dataset.v
+      const syncHost = () => {
+        const host = headerRows().find(row => headerName(row).toLowerCase() === 'host')
+        get('ohost').value = host ? host.querySelector('.own-header-value').value : ''
+      }
+      const addHeader = ({name = '', value = ''} = {}) => {
+        const rows = headerRows()
+        if (rows.length >= 31) return toast('最多设置 30 个其他请求头，另可设置 Host', true)
+        const id = 'ownheader' + (++headerIndex), preset = headerNames.find(h => h.toLowerCase() === name.toLowerCase()) || 'custom'
+        const row = document.createElement('div'); row.className = 'own-header-row'
+        row.innerHTML = `<div class="own-header-name">${selectHTML(id, headerOptions, preset)}<input class="mono own-header-custom" aria-label="自定义请求头名称" placeholder="X-Custom" value="${esc(preset === 'custom' ? name : '')}" autocomplete="off" spellcheck="false" ${preset === 'custom' ? '' : 'hidden'}></div><input id="${id}value" class="mono own-header-value" aria-label="请求头内容" placeholder="填写请求头内容" value="${esc(value)}" autocomplete="off" spellcheck="false"><button type="button" class="ib own-header-remove" aria-label="删除请求头">${icon('x')}</button>`
+        get('ownheaderrows').appendChild(row); bindSelect(row)
+        row.querySelector('.selb').setAttribute('aria-label', '请求头名称')
+        let previousName = headerName(row)
+        const changed = () => {
+          const name = headerName(row)
+          row.querySelector('.own-header-custom').hidden = row.querySelector('.sel').dataset.v !== 'custom'
+          if ([previousName.toLowerCase(), name.toLowerCase()].includes('host')) syncHost()
+          previousName = name
+        }
+        row.querySelectorAll('.selo').forEach(opt => opt.addEventListener('click', changed))
+        row.querySelectorAll('input').forEach(field => field.addEventListener('input', changed))
+        row.querySelector('.own-header-remove').onclick = () => {
+          const wasHost = headerName(row).toLowerCase() === 'host'
+          closeAllSel(); row.remove()
+          if (wasHost) syncHost()
+          get('ownheaderadd').disabled = false; get('ownheaderadd').focus({preventScroll:true})
+        }
+        get('ownheaderadd').disabled = rows.length + 1 >= 31
+        return row
+      }
+      const loadHeaders = data => {
+        closeAllSel(); get('ownheaderrows').replaceChildren()
+        const rows = ownHeaderRows(data)
+        for (const row of rows.length ? rows : [{name:'Host',value:''}]) addHeader(row)
+      }
+      get('ownheaderadd').onclick = () => addHeader()?.querySelector('.selb').focus({preventScroll:true})
+      get('oalpnpreset')._pop.querySelectorAll('.selo').forEach(opt => opt.addEventListener('click', () => {
+        if (filling) return
+        if (pick('oalpnpreset') !== 'custom') get('oalpn').value = pick('oalpnpreset')
+        get('falpncustom').hidden = pick('oalpnpreset') !== 'custom'
+      }))
       const drafts = { [active]: n }
       readForm = (type = pick('ot')) => {
         const d = { name: val('on'), type, s: val('os'), p: val('op'), u: get('ou').value, sni: type === 'ss' ? '' : val('osni'), security: type === 'ss' ? 'none' : ['anytls','hysteria2','tuic'].includes(type) ? 'tls' : pick('osecurity'), udp: get('oudp').checked }
         if (compatibilityExplicit || get('obasic').checked) d.compatibilityMode = get('obasic').checked ? 'basic' : 'strict'
-        const readJSON = id => { try { return JSON.parse(get(id).value || '{}') } catch (e) { e.field = id; throw e } }
+        const fieldError = (message, field) => { const e = new Error(message); e.field = field; throw e }
+        const readJSON = id => {
+          let value
+          try { value = JSON.parse(get(id).value || '{}') } catch (e) { fieldError('高级 JSON 格式不正确，请检查括号、引号和逗号', id) }
+          if (!value || typeof value !== 'object' || Array.isArray(value)) fieldError('高级 JSON 必须是对象', id)
+          return value
+        }
         const extra = readJSON('oimportextras')
         if (Object.keys(extra).length) d.importExtras = extra
         const client = readJSON('oclientoptions')
@@ -4882,7 +5054,9 @@ function installOwnEditor() {
         if (['vless','vmess'].includes(type)) {
           Object.assign(d, { net: pick('onet'), path: val('opath'), host: val('ohost'), serviceName: val('ogrpc'), mode: pick('omode'), packetEncoding: pick('opacket') })
           if (['ws','httpupgrade'].includes(d.net)) {
-            d.headers = readJSON('oheaders')
+            const rows = headerRows(), result = collectOwnHeaders(rows.map(row => ({name:headerName(row),value:row.querySelector('.own-header-value').value})), get('ohost').value)
+            if (result.err) fieldError(result.err, rows[result.row]?.querySelector('.own-header-value').id || 'oheaders')
+            d.headers = result.headers; d.host = result.host
             if (val('oearly') !== '') { d.earlyData = Number(val('oearly')); d.earlyDataHeader = val('oearlyheader') }
           }
         }
@@ -4913,7 +5087,10 @@ function installOwnEditor() {
           if (pick('otuicrtt') !== '') d.zeroRtt = pick('otuicrtt') === '1'
           if (pick('otuicsni') !== '') d.disableSni = pick('otuicsni') === '1'
         }
-        return d
+        if (echState.err) fieldError(echState.err, echState.field)
+        const ech = applyOwnECH(d, echState, get('oech').value, echChanged)
+        if (ech.err) fieldError(ech.err, ech.field)
+        return ech.node
       }
       const fill = data => {
         b.__insecureAcknowledged = false
@@ -4921,16 +5098,14 @@ function installOwnEditor() {
         compatibilityExplicit = data.compatibilityMode !== undefined
         filling = true
         for (const [id, k] of [['on','name'],['os','s'],['op','p'],['ou','u'],['osni','sni'],['opk','pk'],['osid','sid'],['opath','path'],['ohost','host'],['ogrpc','serviceName'],['oencryption','encryption'],['oearly','earlyData'],['oearlyheader','earlyDataHeader'],['oalter','alterId'],['oports','ports'],['ohop','hopInterval'],['oup','upMbps'],['odown','downMbps'],['oopwd','opwd'],['oidlecheck','idleCheck'],['oidletimeout','idleTimeout'],['ominidle','minIdle']]) get(id).value = data[k] ?? (k === 'encryption' ? 'none' : k === 'p' ? 443 : k === 'path' ? '/' : k === 'alterId' ? 0 : '')
-        get('oalpn').value = (data.alpn || []).join(','); get('oheaders').value = JSON.stringify(data.headers || {})
+        get('oalpn').value = (data.alpn || []).join(','); choose('oalpnpreset', alpnPreset(data.alpn || []))
+        get('falpncustom').hidden = pick('oalpnpreset') !== 'custom'
+        loadHeaders(data); loadECH(data)
         get('overifyname').value = data.verifyName || ''; get('ocertsha256').value = data.certSha256 || ''
         get('otuicpassword').value = data.password ?? ''; get('otuicheartbeat').value = data.heartbeatInterval ?? ''
         choose('otuiccongestion', data.congestionControl || ''); choose('otuicrelay', data.udpRelayMode || '')
         choose('otuicrtt', data.zeroRtt === undefined ? '' : data.zeroRtt ? '1' : '0')
         choose('otuicsni', data.disableSni === undefined ? '' : data.disableSni ? '1' : '0')
-        get('oimportextras').value = JSON.stringify(data.importExtras || {})
-        get('fimportextras').hidden = !data.importExtras
-        get('oclientoptions').value = JSON.stringify(data.clientOptions || {})
-        get('fclientoptions').hidden = !data.clientOptions
         get('obasic').checked = data.compatibilityMode === 'basic'
         get('fcompatmode').hidden = !data.clientOptions && data.type !== 'tuic'
         for (const [id, k] of [['ot','type'],['osecurity','security'],['onet','net'],['oflow','flow'],['ofp','fp'],['ocipher','cipher'],['omode','mode'],['opacket','packetEncoding'],['oobfs','obfs'],['oplugin','plugin']]) choose(id, data[k] ?? (k === 'security' ? 'tls' : k === 'net' ? 'tcp' : k === 'mode' ? 'auto' : k === 'fp' ? 'none' : k === 'cipher' ? 'auto' : ''))
@@ -4953,7 +5128,7 @@ function installOwnEditor() {
             const field = get(e.field || 'oheaders')
             field.classList.add('bad'); field.setAttribute('aria-invalid', 'true')
             if (!field.parentElement.querySelector('.ferr')) {
-              const tip = document.createElement('div'); tip.className = 'ferr'; tip.textContent = '高级 JSON 尚未写完，请修正后再切换协议；当前草稿已保留。'; field.parentElement.appendChild(tip)
+              const tip = document.createElement('div'); tip.className = 'ferr'; tip.textContent = e.message + '，请修正后再切换协议；当前草稿已保留。'; field.parentElement.appendChild(tip)
             }
             get('ownadvanced').open = true
             return
@@ -4969,8 +5144,10 @@ function installOwnEditor() {
         hide('ffp', ['hysteria2','tuic'].includes(t))
         hide('ftuic', t !== 'tuic'); hide('ftuicpassword', t !== 'tuic')
         get('oalpn').placeholder = t === 'tuic' ? '留空使用 h3' : ''
+        get('oalpnhint').textContent = t === 'tuic' ? '默认或自定义留空时使用 h3；如服务端使用其他 ALPN，请选择实际值。' : '默认沿用客户端行为；自定义可填写其他 ALPN，按输入顺序保存。'
         hide('ftransport', !transport); hide('fr', t !== 'vless' || sec !== 'reality')
         hide('fw', !transport || !['ws','httpupgrade','h2','http','xhttp'].includes(net)); hide('fgrpc', !transport || net !== 'grpc'); hide('fxmode', !transport || net !== 'xhttp')
+        hide('fhost', ['ws','httpupgrade'].includes(net)); get('ownpathfields').classList.toggle('own-single', ['ws','httpupgrade'].includes(net))
         hide('fvless', t !== 'vless'); hide('fvmess', t !== 'vmess'); hide('fpacket', !transport)
         hide('fwsadvanced', !transport || !['ws','httpupgrade'].includes(net)); hide('fh', t !== 'hysteria2'); hide('fss', t !== 'ss'); hide('fanytls', t !== 'anytls'); hide('fplugin', !pick('oplugin'))
         const cipherOptions = get('ocipher')._pop.querySelectorAll('.selo')
@@ -4986,7 +5163,7 @@ function installOwnEditor() {
       }
       get('ownjson').onclick = async () => {
         let draft
-        try { draft = readForm() } catch (e) { return toast('请先修正表单中的高级 JSON，再打开节点 JSON 编辑。', true) }
+        try { draft = readForm() } catch (e) { return toast(e.message + '，请修正后再打开节点 JSON 编辑。', true) }
         b.inert = true
         try {
           const result = await ownJSONDialog({ initial: JSON.stringify(draft, null, 2), single: true })
@@ -5002,6 +5179,7 @@ function installOwnEditor() {
         }
       }
       b.querySelectorAll('.selo').forEach(opt => opt.addEventListener('click', () => setTimeout(sync, 0)))
+      loadHeaders(n); loadECH(n)
       sync()
       const impb = get('oimpb')
       if (impb) impb.addEventListener('click', async () => {
@@ -5021,7 +5199,7 @@ function installOwnEditor() {
       })
     }, onSubmit: async b => {
       let np
-      try { np = readForm() } catch (e) { return { msg: '高级 JSON 格式不正确', field: e.field || 'oheaders' } }
+      try { np = readForm() } catch (e) { b.querySelector('#ownadvanced').open = true; return { msg: e.message, field: e.field || 'oheaders' } }
       if (!np.name) return { msg: '请填写节点名称', field:'on' }
       if (!np.s) return { msg: '请填写服务器地址', field:'os' }
       if (!/^\d+$/.test(np.p) || +np.p < 1 || +np.p > 65535) return { msg: '端口要是 1-65535 的数字', field:'op' }
@@ -6531,8 +6709,15 @@ input.bad:focus,textarea.bad:focus{border-color:var(--warn);box-shadow:0 0 0 3.5
 .fg{margin-bottom:14px}.fg:last-child{margin-bottom:0}
 .own-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:end;gap:12px;margin-bottom:14px}
 .own-fields.own-address{grid-template-columns:minmax(0,1fr) 112px}
+.own-fields.own-single{grid-template-columns:minmax(0,1fr)}
 .own-fields > .fg{min-width:0;margin:0}
+.own-fields > #fhost > .fg{margin:0}
 .own-fields input{min-width:0;height:40px}
+.own-header-row{display:grid;grid-template-columns:minmax(0,180px) minmax(0,1fr) 32px;gap:8px;align-items:start;margin-bottom:10px}
+.own-header-name{min-width:0;display:grid;gap:8px}
+.own-header-row input{min-width:0;width:100%;height:40px}
+.own-header-row .selb{min-height:40px}
+.own-header-remove{margin-top:4px}
 .own-check{position:relative;display:flex;align-items:center;gap:9px;min-height:36px;margin:0 0 10px;color:var(--tx2);font-size:12.5px;font-weight:500;line-height:1.6;cursor:pointer}
 .own-check input{position:absolute;width:18px;height:18px;margin:0;padding:0;opacity:0;cursor:pointer}
 .own-check-box{display:inline-flex;align-items:center;justify-content:center;flex:0 0 18px;width:18px;height:18px;border:1.5px solid var(--bd);border-radius:5px;background:var(--card);transition:background .14s var(--e),border-color .14s var(--e),box-shadow .14s var(--e)}
@@ -6543,6 +6728,7 @@ input.bad:focus,textarea.bad:focus{border-color:var(--warn);box-shadow:0 0 0 3.5
 .own-check input:focus-visible + .own-check-box{outline:2px solid var(--acc);outline-offset:3px}
 .own-check input:disabled ~ span{opacity:.5;cursor:not-allowed}
 @media (max-width:480px){.own-fields,.own-fields.own-address{grid-template-columns:minmax(0,1fr);gap:14px}}
+@media (max-width:480px){.own-header-row{grid-template-columns:minmax(0,1fr) 32px;gap:8px}.own-header-name{grid-column:1}.own-header-value{grid-column:1;grid-row:2}.own-header-remove{grid-column:2;grid-row:1}}
 .fsep{border:0;border-top:1px solid var(--bd2);margin:4px 0 18px}
 
 /* 顶部居中 toast，位移动画放在 .toast 自身避免两层 transform 打架 */
@@ -8730,6 +8916,7 @@ ${"const parseOwnJSON = (() => {\n" + [
   'return parseOwnJSON'
 ].join(';\n') + '\n})();'}
 ${"(" + installOwnJSONUI.toString() + ")();"}
+${[ownHeaderRows, collectOwnHeaders, ownECHState, applyOwnECH].map(fn => fn.toString()).join(';\n')}
 ${"(" + installOwnEditor.toString().replace(/\n  /g, '\n') + ")();"}
 ${"(" + installLocalFetchClient.toString() + ")();"}
 

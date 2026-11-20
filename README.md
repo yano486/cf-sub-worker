@@ -104,6 +104,8 @@ Clash YAML 使用本地安全子集解析器，支持常见流式 / 块式节点
 
 VLESS 分享链接中的 ECH 使用 v2rayN 支持的 `ech=` 参数。JSON 导入的 `tlsSettings.echConfigList` 会作为完整字符串编码一次后放入该参数，固定配置与 DNS 查询字符串都保留；“复制基础链接”也不会丢掉可以表达的 ECH。与分享链接导入的 `ech` 内容一致时只输出一份，若两处值冲突则明确报错，不静默覆盖。旧版 `echForceQuery` 策略和 `finalmask` 仍没有已验证的等价 URI 表达，会单独提示，不代表整个链接已无损转换。
 
+图形编辑提供独立的“ECH 配置”输入框，直接填写内容即可，不需要手写 JSON。旧链接扩展和 Xray `echConfigList` 会自动显示在此处，不再重复展示在高级 JSON 中；修改或清空时只处理 ECH 内容，保留其他参数和原有存储结构。多处旧 ECH 不一致时必须明确修改或清空确认，不能静默覆盖。此输入框不扩大内核支持范围：例如 TUIC 的 `ech` 链接扩展可原样分享，但不代表已转换为各内核可用的 ECH 设置，请核对兼容提示。
+
 Clash Reality 的 `reality-opts.support-x25519mlkem768` 支持布尔值导入、编辑与再次导出，缺省记录不自动补值。图形表单提供“客户端默认 / 允许指纹提供该能力 / 移除该能力兼容旧服务端”三态。它是 Mihomo 的指纹密钥交换能力开关，不是强制启用后量子，也不是 Xray 的 `mldsa65Verify` 签名验证参数。分享链接保留标准 Reality 公钥、ShortId、SNI、指纹与 Flow；Xray 等目标内核自行协商，不能保证该 Mihomo 开关跨内核、跨版本完全等效。
 
 ### 基础兼容输出
@@ -139,6 +141,10 @@ Clash Reality 的 `reality-opts.support-x25519mlkem768` 支持布尔值导入、
 添加或编辑自有节点时，基础字段按协议切换，高级字段收在「高级配置」中：
 
 成对字段使用对齐的网格布局，窄屏自动改为上下排列；勾选项统一使用站点主题色，保留键盘空格操作、焦点反馈和文字点击切换。
+
+WS / HTTPUpgrade 请求头使用多行“名称下拉 + 内容”编辑，可同时添加 Host、User-Agent、Origin 等，也支持自定义名称和删除行。导入的已有请求头自动填入，内容空格保留；名称不区分大小写，重复或非法名称会阻止保存，不会覆盖其他行。WS 的 Host 只保留一个可见编辑入口，与节点 Host 字段同步。请求头内容可能包含敏感凭据，不要截图外发。
+
+ALPN 提供默认、`h3`、`h2`、`http/1.1`、`h3,h2`、`h2,http/1.1`、`h3,h2,http/1.1` 和自定义选项。这些是常用组合，不是全部合法值；导入其他值或不同顺序时自动进入自定义，保留原顺序，不强行替换为预设。实际选择应与服务端配置匹配。
 
 - **VLESS**：TLS / Reality、Flow、Encryption、TCP / WS / HTTPUpgrade / gRPC / H2 / XHTTP、路径、Host、ServiceName、指纹、ALPN 与 UDP 包编码。
 - **Hysteria2**：完整认证密码（可含 `username:password`）、SNI、ALPN、证书校验、Salamander、端口跳跃、跳跃间隔和带宽。QUIC 不使用 TCP uTLS 指纹；实验性 Gecko / Realm 未混入当前兼容模式。
@@ -256,6 +262,7 @@ node --test test/adaptive-import.cjs test/client-options.cjs # 配置片段、Cl
 node --test test/yaml-multi.cjs                 # 多节点单行 YAML 缩进与安全边界回归
 node --test test/compatibility-mode.cjs test/ech-mapping.cjs # 兼容模式、ECH 映射及保密边界回归
 node --test test/ech-share.cjs                  # VLESS ECH 双导入路径、编码与只读分享回归
+node --test test/editor-fields.cjs              # 多行请求头、独立 ECH、旧字段保留与安全校验回归
 node --test test/reality-pq.cjs                 # Reality 能力开关、三态及跨格式身份保留回归
 node --test test/tuic.cjs                       # TUIC v5 导入、编辑、格式转换与证书校验边界回归
 node --test test/import-compatibility.cjs       # 官方分享链接字段与扩展参数导入回归

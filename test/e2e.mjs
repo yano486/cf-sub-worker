@@ -277,6 +277,87 @@ try {
     if(warning){warning.querySelector('[data-ok]').click();await __until(()=>__top()===form&&!form.inert)}
     const filled=form.querySelector('#ot').dataset.v==='tuic'&&form.querySelector('#oinsecure').checked&&form.querySelector('#otuicsni').dataset.v==='1'
     await __close();return {'实际跳过校验不能绕过风险提示':!!warned,'填回保留独立禁用SNI和跳过校验状态':filled}`)
+  await step('WS请求头：多行下拉、导入、自定义和保存往返', `const count=Object.keys(OWN.own).length
+    const raw={name:'Header-editor-demo',type:'vless',s:'safe.example',p:443,u:'11111111-2222-3333-4444-555555555555',security:'tls',net:'ws',path:'/headers',host:'old.example',headers:{Host:'old.example','User-Agent':'Synthetic-UA','X-Imported':'  preserve  '},flow:'',encryption:'none'}
+    editOwn(null);await __until(__top);const form=__top();form.querySelector('#ownjson').click();let editor=await __until(()=>__top()!==form&&__top())
+    editor.querySelector('#ownjsontext').value=JSON.stringify(raw);editor.querySelector('[data-ok]').click();await __until(()=>__top()===form&&!form.inert)
+    const root=form.querySelector('#ownheaderrows');if(!root){await __close();return {'存在多行请求头编辑器':false}}
+    const rows=()=>[...root.querySelectorAll('.own-header-row')],find=name=>rows().find(r=>r.querySelector('.sel').dataset.v===name)
+    const loaded=rows().length===3&&find('Host').querySelector('.own-header-value').value==='old.example'&&find('User-Agent').querySelector('.own-header-value').value==='Synthetic-UA'
+    const custom=rows().find(r=>r.querySelector('.sel').dataset.v==='custom'),kept=custom&&custom.querySelector('.own-header-custom').value==='X-Imported'&&custom.querySelector('.own-header-value').value==='  preserve  '
+    const host=find('Host').querySelector('.own-header-value');host.value='new.example';host.dispatchEvent(new Event('input',{bubbles:true}))
+    const hostUnified=form.querySelector('#ohost').value==='new.example'&&form.querySelector('#fhost').hidden
+    form.querySelector('#ownheaderadd').click();const added=rows().at(-1);added.querySelector('.selb').click();document.querySelector('.selp.portal .selo[data-v="Origin"]').click()
+    added.querySelector('.own-header-value').value='https://origin.example';added.querySelector('.own-header-value').dispatchEvent(new Event('input',{bubbles:true}))
+    await __ok();await __until(()=>OWN&&Object.keys(OWN.own).length===count+1);const key=Object.keys(OWN.own).find(k=>OWN.own[k].name===raw.name),saved=OWN.own[key]
+    const stored=saved.host==='new.example'&&saved.headers.Host==='new.example'&&saved.headers['User-Agent']==='Synthetic-UA'&&saved.headers.Origin==='https://origin.example'&&saved.headers['X-Imported']==='  preserve  '
+    editOwn(key);await __until(__top);const reopened=__top(),reopenedRows=[...reopened.querySelectorAll('.own-header-row')]
+    const reopenedCorrect=reopenedRows.length===4&&!reopened.querySelector('#oheaders textarea')
+    reopenedRows.find(r=>r.querySelector('.sel').dataset.v==='User-Agent').querySelector('.own-header-remove').click();await __ok();await __until(()=>OWN&&!OWN.own[key].headers['User-Agent'])
+    const removed=OWN.own[key].headers.Host==='new.example'&&OWN.own[key].headers.Origin==='https://origin.example'
+    delOwn(key);await __until(__top);await __ok();await __until(()=>OWN&&!OWN.own[key])
+    return {'已有JSON自动显示Host和UA':loaded,'未知名称及内容空格不丢失':!!kept,'Host只有一个可见编辑入口':hostUnified,'多请求头一次保存且不互相覆盖':stored,'重开保留多行且不需要JSON':reopenedCorrect,'删除UA不影响其他请求头':removed}`)
+  await step('WS请求头：30个已有请求头与独立Host完整往返', `const headers=Object.fromEntries(Array.from({length:30},(_,i)=>['X-'+i,'value-'+i]))
+    editOwn(null);await __until(__top);const form=__top();form.querySelector('#ownjson').click();let editor=await __until(()=>__top()!==form&&__top())
+    editor.querySelector('#ownjsontext').value=JSON.stringify({name:'Headers-limit',type:'vless',s:'safe.example',p:443,u:'11111111-2222-3333-4444-555555555555',security:'tls',net:'ws',host:'cdn.example',flow:'',encryption:'none',headers})
+    editor.querySelector('[data-ok]').click();await __until(()=>__top()===form&&!form.inert)
+    const loaded=form.querySelectorAll('.own-header-row').length===31
+    form.querySelector('#ownjson').click();editor=await __until(()=>__top()!==form&&__top())
+    if(!editor){await __close();return {'原有30个请求头加Host不会被截断':loaded,'合法上限配置仍可完整读取':false}}
+    const raw=JSON.parse(editor.querySelector('#ownjsontext').value),kept=raw.host==='cdn.example'&&Object.keys(raw.headers).length===30&&Object.keys(headers).every(k=>raw.headers[k]===headers[k])
+    editor.querySelector('[data-x]').click();await __until(()=>__top()===form&&!form.inert);await __close()
+    return {'原有30个请求头加Host不会被截断':loaded,'合法上限配置仍可完整读取':kept}`)
+  await step('WS请求头：重复名称阻止提交且保留草稿', `editOwn(null);await __until(__top);const form=__top()
+    form.querySelector('#osecurity .selb').click();document.querySelector('.selp.portal .selo[data-v="tls"]').click();form.querySelector('#onet .selb').click();document.querySelector('.selp.portal .selo[data-v="ws"]').click();await __w(40)
+    const root=form.querySelector('#ownheaderrows');if(!root){await __close();return {'提供多行请求头校验':false}}
+    form.querySelector('#on').value='Header-duplicate';form.querySelector('#os').value='safe.example';form.querySelector('#ou').value='11111111-2222-3333-4444-555555555555';form.querySelector('#ownadvanced').open=true
+    const first=root.querySelector('.own-header-value');first.value='same.example';first.dispatchEvent(new Event('input',{bubbles:true}));form.querySelector('#ownheaderadd').click()
+    const duplicate=root.querySelectorAll('.own-header-row')[1];duplicate.querySelector('.selb').click();document.querySelector('.selp.portal .selo[data-v="Host"]').click();duplicate.querySelector('.own-header-value').value='other.example'
+    const real=window.fetch;let writes=0;window.fetch=(url,options)=>{if(url==='/api/own'&&options&&options.method==='POST')writes++;return real(url,options)}
+    form.querySelector('[data-ok]').click();await __until(()=>form.querySelector('.ferr'));window.fetch=real
+    const result={'重复Host明确报错且未写入':writes===0&&/重复/.test(form.querySelector('.ferr').textContent),'错误后保留各行内容':root.querySelectorAll('.own-header-row').length===2&&first.value==='same.example'&&duplicate.querySelector('.own-header-value').value==='other.example'}
+    await __close();return result`)
+  await step('ECH独立输入框：旧扩展自动填入、分享和清空', `const original='ech.example+https://dns.example/dns-query?value=a%2Bb&mode=full',changed='changed.example+https://dns.example/dns-query?value=%2B&mode=full',count=Object.keys(OWN.own).length
+    editOwn(null);await __until(__top);const form=__top();form.querySelector('#ownjson').click();const editor=await __until(()=>__top()!==form&&__top())
+    editor.querySelector('#ownjsontext').value=JSON.stringify({name:'ECH-field-demo',type:'tuic',s:'safe.example',p:443,u:'11111111-2222-3333-4444-555555555555',password:'fictional',security:'tls',alpn:['h3'],insecure:false,importExtras:{query:[['ech',original],['keep','untouched']]}})
+    editor.querySelector('[data-ok]').click();await __until(()=>__top()===form&&!form.inert);const input=form.querySelector('#oech')
+    if(!input){await __close();return {'ECH有独立输入框':false}}
+    const populated=input.value===original&&!JSON.parse(form.querySelector('#oimportextras').value).query.some(([key])=>key.toLowerCase()==='ech')
+    input.value=changed;input.dispatchEvent(new Event('input',{bubbles:true}));await __ok();await __until(()=>OWN&&Object.keys(OWN.own).length===count+1)
+    const key=Object.keys(OWN.own).find(k=>OWN.own[k].name==='ECH-field-demo'),url=new URL(OWN.links[key]),shared=url.searchParams.get('ech')===changed&&url.searchParams.getAll('ech').length===1
+    const extraPreserved=OWN.own[key].importExtras.query.some(([key,value])=>key==='keep'&&value==='untouched')
+    editOwn(key);await __until(__top);const reopened=__top(),retained=reopened.querySelector('#oech').value===changed
+    reopened.querySelector('#oech').value='';reopened.querySelector('#oech').dispatchEvent(new Event('input',{bubbles:true}));await __ok();await __until(()=>OWN&&!new URL(OWN.links[key]).searchParams.has('ech'))
+    const cleared=!OWN.own[key].importExtras.query.some(([key])=>key.toLowerCase()==='ech')&&OWN.own[key].importExtras.query[0][0]==='keep'
+    delOwn(key);await __until(__top);await __ok();await __until(()=>OWN&&!OWN.own[key])
+    return {'旧ECH自动填框且不重复显示在扩展JSON':populated,'分享保留完整内容且只编码一次':shared,'其他扩展不受影响':extraPreserved,'重新打开可继续编辑':retained,'清空只删除ECH':cleared}`)
+  await step('ECH独立输入框：原生字段、冲突和协议草稿隔离', `editOwn(null);await __until(__top);const form=__top()
+    const fill=async raw=>{form.querySelector('#ownjson').click();const editor=await __until(()=>__top()!==form&&__top());editor.querySelector('#ownjsontext').value=JSON.stringify(raw);editor.querySelector('[data-ok]').click();await __until(()=>__top()===form&&!form.inert)}
+    const inspect=async()=>{form.querySelector('#ownjson').click();const editor=await __until(()=>__top()!==form&&__top());const raw=JSON.parse(editor.querySelector('#ownjsontext').value);editor.querySelector('[data-x]').click();await __until(()=>__top()===form&&!form.inert);return raw}
+    const raw={name:'ECH-native-draft',type:'vless',s:'safe.example',p:443,u:'11111111-2222-3333-4444-555555555555',security:'tls',net:'ws',flow:'',encryption:'none',headers:{Host:'cdn.example','User-Agent':'Draft-UA'},host:'cdn.example',clientOptions:{xray:{tlsSettings:{echConfigList:'native.example',echForceQuery:'full'}}},importExtras:{query:[['ech','different.example'],['keep','unchanged']]}}
+    await fill(raw);const conflict=!form.querySelector('#oechconflict').hidden&&form.querySelector('#oech').value==='native.example'
+    const real=window.fetch;let writes=0;window.fetch=(url,options)=>{if(url==='/api/own'&&options&&options.method==='POST')writes++;return real(url,options)}
+    form.querySelector('[data-ok]').click();await __until(()=>form.querySelector('.ferr'));window.fetch=real
+    const blocked=writes===0&&/ECH/.test(form.querySelector('.ferr').textContent)
+    form.querySelector('#oech').value='selected.example';form.querySelector('#oech').dispatchEvent(new Event('input',{bubbles:true}));const resolved=await inspect()
+    const preserved=resolved.clientOptions.xray.tlsSettings.echConfigList==='selected.example'&&resolved.clientOptions.xray.tlsSettings.echForceQuery==='full'&&resolved.importExtras.query.some(([k,v])=>k==='ech'&&v==='selected.example')&&resolved.importExtras.query.some(([k,v])=>k==='keep'&&v==='unchanged')
+    const choose=async v=>{form.querySelector('#ot .selb').click();document.querySelector('.selp.portal .selo[data-v="'+v+'"]').click();await __w(50)}
+    await choose('ss');const isolated=form.querySelector('#oech').value===''&&form.querySelector('#fvtls').hidden;await choose('vless')
+    const restored=form.querySelector('#oech').value==='selected.example'&&form.querySelectorAll('.own-header-row').length===2
+    form.querySelector('.own-header-row .selb').click();const row=form.querySelector('.own-header-row');row.querySelector('.own-header-remove').click()
+    const cleaned=!document.querySelector('.selp.portal')&&form.querySelectorAll('.own-header-row').length===1
+    await __close();return {'原生与链接ECH冲突有明确提示':conflict,'未确认的冲突阻止写入':blocked,'确认后同时更新来源并保留查询策略':preserved,'切换SS不携带其他协议ECH':isolated,'返回原协议恢复ECH和请求头草稿':restored,'删除行不残留悬浮菜单':cleaned}`)
+  await step('ALPN：预设下拉和非标准自定义值保留顺序', `editOwn(null);await __until(__top);const form=__top();form.querySelector('#ownjson').click();let editor=await __until(()=>__top()!==form&&__top())
+    editor.querySelector('#ownjsontext').value=JSON.stringify({name:'ALPN-custom',type:'vless',s:'safe.example',p:443,u:'11111111-2222-3333-4444-555555555555',security:'tls',net:'tcp',flow:'',encryption:'none',alpn:['custom-protocol','h3']})
+    editor.querySelector('[data-ok]').click();await __until(()=>__top()===form&&!form.inert)
+    const preset=form.querySelector('#oalpnpreset');if(!preset){await __close();return {'ALPN有预设下拉':false}}
+    const custom=preset.dataset.v==='custom'&&form.querySelector('#oalpn').value==='custom-protocol,h3'&&!form.querySelector('#falpncustom').hidden
+    form.querySelector('#ownjson').click();editor=await __until(()=>__top()!==form&&__top());const original=JSON.parse(editor.querySelector('#ownjsontext').value).alpn.join(',')==='custom-protocol,h3'
+    editor.querySelector('[data-x]').click();await __until(()=>__top()===form);preset.querySelector('.selb').click();document.querySelector('.selp.portal .selo[data-v="h2,http/1.1"]').click()
+    const chosen=form.querySelector('#oalpn').value==='h2,http/1.1'&&form.querySelector('#falpncustom').hidden
+    form.querySelector('#ownjson').click();editor=await __until(()=>__top()!==form&&__top());const saved=JSON.parse(editor.querySelector('#ownjsontext').value).alpn.join(',')==='h2,http/1.1'
+    editor.querySelector('[data-x]').click();await __until(()=>__top()===form);await __close()
+    return {'导入未知值自动进入自定义':custom,'打开JSON不改变原有ALPN顺序':original,'选择常用组合无需手写':chosen,'组合顺序正确进入节点配置':saved}`)
   await step('Reality导入：后量子能力字段经过JSON和表单保存不丢失', `const uuid='11111111-2222-3333-4444-555555555555',pk='A'.repeat(43),count=Object.keys(OWN.own).length
     editOwn(null);await __until(__top);const form=__top();form.querySelector('#ownjson').click();const editor=await __until(()=>__top()!==form&&__top())
     editor.querySelector('#ownjsontext').value='    - { name: Reality-PQ-demo, type: vless, server: safe.example, port: 25565, uuid: '+uuid+', udp: true, flow: xtls-rprx-vision, tls: true, skip-cert-verify: false, client-fingerprint: firefox, servername: tls.example, reality-opts: { public-key: '+pk+', short-id: 0592b9f3, support-x25519mlkem768: true } }'
@@ -363,7 +444,8 @@ try {
     warning.querySelector('[data-x]').click();await __until(()=>__top()===form&&!form.inert);const cancelled=!toggle.checked
     toggle.click();await __until(()=>__top()!==form);__top().querySelector('[data-ok]').click();await __until(()=>__top()===form&&toggle.checked&&!form.inert)
     await __ok();await __until(()=>OWN&&OWN.own[key]&&OWN.own[key].compatibilityMode==='basic')
-    const kept=JSON.stringify(OWN.own[key].clientOptions)===JSON.stringify(options)
+    const canonical=v=>Array.isArray(v)?v.map(canonical):v&&typeof v==='object'?Object.fromEntries(Object.keys(v).sort().map(k=>[k,canonical(v[k])])):v
+    const kept=JSON.stringify(canonical(OWN.own[key].clientOptions))===JSON.stringify(canonical(options))
     const preview=await(await fetch('/api/preview?pf=main&fmt=share')).json()
     const present=preview.ok&&atob(preview.body).includes(encodeURIComponent(own.name))
     const notices=(preview.warnings||[]).some(w=>w.name===own.name&&/基础兼容/.test(w.reason))
@@ -639,10 +721,28 @@ try {
       return {'TUIC表单不横向溢出':r.left>=0&&r.right<=innerWidth+1&&ct.scrollWidth<=ct.clientWidth+1&&controls.scrollWidth<=controls.clientWidth+1,
         '密码独立且不显示TCP传输和指纹':!form.querySelector('#ftuicpassword').hidden&&form.querySelector('#ftransport').hidden&&form.querySelector('#ffp').hidden,
         '默认不主动启用0RTT或跳过校验':form.querySelector('#otuicrtt').dataset.v===''&&!form.querySelector('#oinsecure').checked,
-        'ALPN默认h3且留空有明确提示':form.querySelector('#oalpn').value==='h3'&&/h3/.test(form.querySelector('#oalpn').placeholder)}`)
+        'ALPN默认h3且留空有明确提示':form.querySelector('#oalpnpreset').dataset.v==='h3'&&form.querySelector('#oalpnpreset').offsetHeight>0&&form.querySelector('#falpncustom').hidden&&/h3/.test(form.querySelector('#oalpnhint').textContent)}`)
     if(process.env.E2E_SCREENSHOT_DIR){
       const shot=await b.send('Page.captureScreenshot',{format:'png'})
       fs.writeFileSync(path.join(process.env.E2E_SCREENSHOT_DIR,name+'-tuic-editor.png'),Buffer.from(shot.data,'base64'))
+    }
+    await b.run(`await __close()`)
+    await step(name+' 请求头与ECH表单布局', `editOwn(null);await __until(__top);const form=__top()
+      form.querySelector('#osecurity .selb').click();document.querySelector('.selp.portal .selo[data-v="tls"]').click();form.querySelector('#onet .selb').click();document.querySelector('.selp.portal .selo[data-v="ws"]').click();await __w(60)
+      form.querySelector('#ownadvanced').open=true;form.querySelector('#oech').value='ech.example+https://dns.example/dns-query';form.querySelector('#oech').dispatchEvent(new Event('input',{bubbles:true}))
+      form.querySelector('#ownheaderadd').click();const row=[...form.querySelectorAll('.own-header-row')].at(-1);row.querySelector('.own-header-custom').value='X-Custom';row.querySelector('.own-header-value').value='long-value-'.repeat(20)
+      row.querySelector('.own-header-value').focus();row.scrollIntoView({block:'center'});await __w(60)
+      const r=form.getBoundingClientRect(),ct=form.querySelector('.ct'),hr=row.getBoundingClientRect(),controls=[...row.querySelectorAll('input,button')].filter(el=>el.offsetHeight>0)
+      return {'弹窗和请求头行不横向溢出':r.left>=0&&r.right<=innerWidth+1&&ct.scrollWidth<=ct.clientWidth+1&&hr.left>=r.left&&hr.right<=r.right,
+        '输入和删除按钮在行内':controls.every(el=>{const q=el.getBoundingClientRect();return q.width>=28&&q.left>=hr.left-1&&q.right<=hr.right+1}),
+        'ECH独立输入且不需要JSON':form.querySelector('#oech').type==='text'&&form.querySelector('#oech').offsetHeight>0&&!form.querySelector('#oheaders textarea'),
+        'WS路径占满可用宽度且Host不重复':form.querySelector('#fhost').hidden&&form.querySelector('#ownpathfields').classList.contains('own-single')}`)
+    if(process.env.E2E_SCREENSHOT_DIR){
+      const shot=await b.send('Page.captureScreenshot',{format:'png'})
+      fs.writeFileSync(path.join(process.env.E2E_SCREENSHOT_DIR,name+'-header-editor.png'),Buffer.from(shot.data,'base64'))
+      await b.run(`__top().querySelector('#oech').scrollIntoView({block:'center'})`)
+      const echShot=await b.send('Page.captureScreenshot',{format:'png'})
+      fs.writeFileSync(path.join(process.env.E2E_SCREENSHOT_DIR,name+'-ech-alpn-editor.png'),Buffer.from(echShot.data,'base64'))
     }
     await b.run(`await __close()`)
     if (opt.mobile) await b.send('Emulation.setTouchEmulationEnabled', {enabled:false})
