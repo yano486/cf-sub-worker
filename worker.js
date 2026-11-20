@@ -6692,6 +6692,7 @@ input.mono{font-family:var(--mono);font-size:12.5px}
 .pol .ord{font-size:11px;color:var(--tx4);font-variant-numeric:tabular-nums;width:16px;text-align:right;flex-shrink:0}
 .arrow{color:var(--tx4);font-size:12px}
 .tgt{font-size:12px;color:var(--tx2);background:var(--bg);border:1px solid var(--bd2);padding:2.5px 8px;border-radius:6px;white-space:nowrap}
+.up.own .own-protocol{display:inline-flex;align-items:center;justify-content:center;min-width:104px;height:26px;box-sizing:border-box;padding:0 10px;font-size:12px;font-weight:500;line-height:18px;text-align:center}
 .tgt.strict{background:var(--accBg);border-color:var(--accBd);color:var(--acc)}
 .tgt.gone{background:var(--warnBg);border-color:var(--warnBd);color:var(--warn);text-decoration:line-through}
 .tgt.okc{background:var(--okBg);border-color:var(--okBd);color:var(--ok)}
@@ -7906,7 +7907,7 @@ function viewNode(){
   return h + '<div class="foot anim" style="animation-delay:.14s">节点每小时自动刷新，上游故障时沿用缓存</div>'
 }
 
-const protoName = n => n.type === 'vless' ? ('VLESS ' + (n.security === 'reality' || (n.security === undefined && n.net !== 'ws') ? 'Reality' : (n.net || 'tcp').toUpperCase())) : ({hysteria2:'Hysteria2',ss:'Shadowsocks',vmess:'VMess',anytls:'AnyTLS',tuic:'TUIC v5'}[n.type] || n.type)
+const protoName = n => n.type === 'vless' ? ('VLESS ' + (n.security === 'reality' || (n.security === undefined && n.net !== 'ws') ? 'Reality' : (n.net || 'tcp').toUpperCase())) : ({hysteria2:'Hysteria2',ss:'Shadowsocks',vmess:'VMess',anytls:'AnyTLS',tuic:'TUIC'}[n.type] || n.type)
 function ownCardInner(){
   const ow = (OWN && OWN.own) || {}
   let h = \`<div class="ttl">自有节点<span class="sub">自建服务器</span><span class="sp">
@@ -7922,7 +7923,7 @@ function ownCardInner(){
   h += Object.entries(ow).map(([k,n]) => \`<div class="up own" data-key="\${esc(k)}">
       <span class="dot"></span>
       <span class="nm">\${esc(n.name)}</span>
-      <span class="tgt">\${esc(protoName(n))}</span>
+      <span class="tgt own-protocol">\${esc(protoName(n))}</span>
       <span class="u">\${esc(n.s)}:\${esc(String(n.p))}\${n.ports ? ' · 跳跃 ' + esc(n.ports) : ''}</span>
       <button class="ib" data-tip="复制分享链接" aria-label="复制分享链接" onclick="copyOwnLink(\${jsq(k)},this)">\${icon('link')}</button>
       <button class="ib" data-tip="编辑" aria-label="编辑" onclick="editOwn(\${jsq(k)})">\${icon('edit')}</button>

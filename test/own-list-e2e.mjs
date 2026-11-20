@@ -25,7 +25,40 @@ try {
     OWN={ok:true,own:{a:{name:'A',type:'tuic',s:'safe.example',p:443},b:{name:'B',type:'anytls',s:'safe.example',p:443}},compatibility:{}}
     const div=document.createElement('div');div.innerHTML=ownCardInner();return [...div.querySelectorAll('.up .tgt')].map(x=>x.textContent)
   }finally{OWN=before}`)
-  check(labels[0] === 'TUIC v5' && labels[1] === 'AnyTLS', 'TUIC badge uses the same display naming convention as the editor')
+  check(labels[0] === 'TUIC' && labels[1] === 'AnyTLS', 'list badge shows TUIC without a version suffix')
+  for (const [name,w,h,opt] of [
+    ['badges-desktop-light',1100,900,{}], ['badges-desktop-dark',1100,900,{dark:true}],
+    ['badges-mobile-dark',390,844,{mobile:true,dark:true}], ['badges-mobile-light',320,844,{mobile:true}],
+    ['badges-desktop-200',550,450,{scale:2,dark:true}],
+  ]) {
+    await b.viewport(w,h,opt)
+    await b.open(pathToFileURL(out).href+'#node'); await b.run(until)
+    const appearance = await b.run(`const n={s:'node.example',p:443};OWN={ok:true,own:{
+      a:{...n,name:'入口 WS',type:'vless',net:'ws'},b:{...n,name:'入口 TUIC',type:'tuic'},c:{...n,name:'入口 HY2',type:'hysteria2'},
+      d:{...n,name:'入口 SS',type:'ss'},e:{...n,name:'入口 VMess',type:'vmess'},f:{...n,name:'入口 AnyTLS',type:'anytls'},
+      g:{...n,name:'长传输名称',type:'vless',net:'httpupgrade',security:'tls'}},compatibility:{}};
+      document.getElementById('owncard').innerHTML=ownCardInner();const card=document.getElementById('owncard');card.scrollIntoView({block:'center'});
+      const badges=[...card.querySelectorAll('.up .tgt')];const values=badges.map(el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el),range=document.createRange();range.selectNodeContents(el);const text=range.getBoundingClientRect();return {
+        h:r.height,left:r.left,right:r.right,radius:s.borderRadius,font:s.font,padding:s.padding,text:el.textContent,
+        center:Math.abs(text.left+text.width/2-r.left-r.width/2)<1.1&&Math.abs(text.top+text.height/2-r.top-r.height/2)<1.6,
+        fits:text.width<=r.width-parseFloat(s.paddingLeft)-parseFloat(s.paddingRight)-2+1&&text.height<=r.height-2+1}});
+      return {uniform:values.every(v=>Math.abs(v.h-values[0].h)<.1&&v.radius===values[0].radius&&v.font===values[0].font&&v.padding===values[0].padding),centered:values.every(v=>v.center),
+        fits:values.every(v=>v.fits)&&values.at(-1).text==='VLESS HTTPUPGRADE'&&card.scrollWidth<=card.clientWidth+1,
+        aligned:values.every(v=>Math.abs(v.left-values[0].left)<1)&&(innerWidth<=640||values.every(v=>Math.abs(v.right-values[0].right)<1)),
+        shortWidths:values.slice(0,6).every(v=>Math.abs(v.right-v.left-values[0].right+values[0].left)<1),
+        labels:values.map(v=>v.text).join('|'),cardWidth:card.clientWidth};`)
+    check(appearance.uniform&&appearance.centered&&appearance.shortWidths, name+' consistent badge metrics and centered text')
+    check(appearance.fits&&appearance.aligned, name+' aligned column and full long protocol name without overflow')
+    if(process.env.E2E_SCREENSHOT_DIR){
+      fs.mkdirSync(process.env.E2E_SCREENSHOT_DIR,{recursive:true})
+      const clip=await b.run(`const r=document.getElementById('owncard').getBoundingClientRect();return {x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height,scale:1}`)
+      const shot=await b.send('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip})
+      fs.writeFileSync(path.join(process.env.E2E_SCREENSHOT_DIR,name+'.png'),Buffer.from(shot.data,'base64'))
+    }
+  }
+  await b.viewport(1100,900);await b.open(pathToFileURL(out).href+'#node');await b.run(until)
+  const editorLabel=await b.run(`editOwn(null);await until(()=>document.querySelector('#ot'));const form=[...document.querySelectorAll('.bd:not(.out) .md')].at(-1),label=form.querySelector('#ot')._pop.querySelector('[data-v="tuic"] span').textContent;form.querySelector('[data-close]').click();await until(()=>!document.querySelector('.bd:not(.out)'));return label`)
+  check(editorLabel==='TUIC v5','editor retains the TUIC v5 compatibility explanation')
   const grouped = await b.run(`const before=OWN;try{
     const reason='导入扩展字段已保留，但当前完整配置尚未应用：ech', w=format=>({field:'importExtras',reason,format})
     OWN={ok:true,own:{a:{name:'A<img src=x>',s:'safe.example',p:443},b:{name:'B',s:'safe.example',p:443},c:{name:'C',s:'safe.example',p:443}},compatibility:{a:['clash','singbox','shadowrocket'].map(w),b:['shadowrocket','clash','singbox'].map(w),c:[w('clash')]}}
@@ -35,7 +68,7 @@ try {
   check(grouped.count === 2 && grouped.first === 'A<img src=x>、B：Clash / sing-box / Shadowrocket：导入扩展字段已保留，但当前完整配置尚未应用：ech', 'identical warnings merge node names and preserve the exact client set')
   check(grouped.second?.startsWith('C：Clash：') && grouped.safe && grouped.summary?.includes('2'), 'different client sets remain separate and names are escaped')
 
-  for (const mobile of [false, true]) {
+  for (const mobile of process.env.CF_SUB_BADGES_ONLY ? [] : [false, true]) {
     const name = mobile ? 'mobile' : 'desktop'
     await b.viewport(mobile ? 390 : 1100, mobile ? 844 : 900, { mobile, dark:mobile })
     await b.open(pathToFileURL(out).href + '#node')
