@@ -1295,7 +1295,9 @@ function parseShareLineRaw(line) {
     const ports = hyPorts || q.mport || ''
     if (/^\d+(-\d+)?(,\d+(-\d+)?)*$/.test(ports)) kv.ports = yq(ports)         // 端口跳跃
   } else if (scheme === 'tuic') {
-    Object.assign(kv, { type: 'tuic', server: yq(host), port, uuid: yq(user), password: yq(safeDecode(u.password)), udp: 'true' })
+    // v2rayN encodes the whole UUID:password pair; decode once before splitting.
+    const ci = whole.indexOf(':')
+    Object.assign(kv, { type: 'tuic', server: yq(host), port, uuid: yq(ci < 0 ? whole : whole.slice(0, ci)), password: yq(ci < 0 ? '' : whole.slice(ci + 1)), udp: 'true' })
     shareTLS(kv, { ...q, security: 'tls' }, 'sni')
     if (q.congestion_control) kv['congestion-controller'] = yq(q.congestion_control)
   } else if (scheme === 'anytls') {

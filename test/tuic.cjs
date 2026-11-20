@@ -18,7 +18,7 @@ function setup() {
     fetch() { throw new Error('TUIC tests must not connect to real nodes') },
     CONF: { get: async (key, type) => data[key] === undefined ? null : type === 'json' ? JSON.parse(data[key]) : data[key], put: async (key, value) => { data[key] = value } },
   })
-  vm.runInContext(source + ';globalThis.T={parseOwnJSON,normalizeOwnNode,shareToOwn,shareLink,ownToSB,ownToKv,toSB,ownCompatibility,genClash,genSB,genSR,genShare,apiRoute,makeCookie,adminHTML}', ctx)
+  vm.runInContext(source + ';globalThis.T={parseOwnJSON,normalizeOwnNode,parseShareLine,shareToOwn,shareLink,ownToSB,ownToKv,toSB,ownCompatibility,genClash,genSB,genSR,genShare,apiRoute,makeCookie,adminHTML}', ctx)
   return { T: ctx.T, data }
 }
 const { T } = setup()
@@ -43,6 +43,54 @@ test('TUIC v5 URI imports and shares distinct UUID and percent-encoded password'
   assert.equal(shared.searchParams.get('congestion_control'), 'bbr')
   assert.equal(shared.searchParams.get('allow_insecure'), '1')
   assert.equal(T.shareToOwn(shared.href).node.password, PASSWORD)
+})
+
+test('v2rayN whole-encoded TUIC userinfo splits at the first decoded colon exactly once', () => {
+  for (const password of [PASSWORD, '', '  a:b:c+@/%3A%2F#  ', 'literal%41%25+']) {
+    const link = `tuic://${encodeURIComponent(UUID + ':' + password)}@[2001:db8::1]:8443?sni=tls.example&alpn=h3&congestion_control=bbr#TUIC`
+    const result = T.shareToOwn(link)
+    assert.ok(result && result.node, result && result.err)
+    assert.equal(result.node.u, UUID)
+    assert.equal(result.node.password, password)
+    assert.equal(result.node.s, '2001:db8::1')
+    assert.equal(result.node.congestionControl, 'bbr')
+    assert.equal(T.ownToSB(result.node).password, password)
+    assert.equal(T.shareToOwn(uri(result.node)).node.password, password)
+  }
+  for (const userinfo of [encodeURIComponent('invalid-uuid:' + PASSWORD), encodeURIComponent(encodeURIComponent(UUID + ':' + PASSWORD))]) {
+    const r = T.shareToOwn('tuic://' + userinfo + '@safe.example:443#Invalid')
+    assert.ok(r && r.err, 'invalid or double-encoded UUIDs must remain rejected')
+  }
+})
+
+test('upstream TUIC parsing uses the same decoded v2rayN credentials as own-node imports', () => {
+  const link = `tuic://${encodeURIComponent(UUID + ':' + PASSWORD)}@safe.example:443?alpn=h3#Upstream`
+  const kv = T.parseShareLine(link)
+  assert.ok(kv)
+  const item = { name: 'Upstream', kv }
+  const outbound = T.toSB(item)
+  assert.ok(outbound, 'upstream converter must receive a UUID, not the encoded credential pair')
+  assert.equal(outbound.uuid, UUID)
+  assert.equal(outbound.password, PASSWORD)
+  const roundTrip = T.shareToOwn(T.shareLink(item))
+  assert.equal(roundTrip.node.u, UUID)
+  assert.equal(roundTrip.node.password, PASSWORD)
+})
+
+test('authenticated parse-share accepts the official v2rayN TUIC format without persisting nodes', async () => {
+  const { T: api, data } = setup()
+  const req = new Request('https://test.example/api/parse-share', {
+    method: 'POST',
+    headers: { Cookie: 'sess=' + await api.makeCookie(), Origin: 'https://test.example', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ link: `tuic://${encodeURIComponent(UUID + ':' + PASSWORD)}@safe.example:443?alpn=h3#TUIC` }),
+  })
+  const response = await api.apiRoute(req, new URL(req.url), { waitUntil() {} })
+  const result = await response.json()
+  assert.equal(response.status, 200, JSON.stringify(result))
+  assert.equal(result.ok, true)
+  assert.equal(result.node.u, UUID)
+  assert.equal(result.node.password, PASSWORD)
+  assert.equal(data.nodes, undefined, 'parsing must not write nodes before explicit save')
 })
 
 test('TUIC native, Clash JSON, sing-box JSON and indented YAML fragments import', () => {

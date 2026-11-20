@@ -249,7 +249,7 @@ try {
     return { '链接解析填表': filled, '保存后多一行': !!k, '删除后恢复': document.querySelectorAll('.uplist.own .up').length === 3 }`)
   await step('TUIC：分享导入、独立密码和高级编辑保存', `const count=Object.keys(OWN.own).length
     editOwn(null);await __until(__top);const form=__top(),uuid='11111111-2222-3333-4444-555555555555',password='synthetic:p@ss+/ %25#'
-    form.querySelector('#oimp').value='tuic://'+uuid+':'+encodeURIComponent(password)+'@safe.example:443?sni=tls.example&alpn=h3&congestion_control=bbr#TUIC-demo'
+    form.querySelector('#oimp').value='tuic://'+encodeURIComponent(uuid+':'+password)+'@safe.example:443?sni=tls.example&alpn=h3&congestion_control=bbr#TUIC-demo'
     form.querySelector('#oimpb').click();await __until(()=>form.querySelector('#on').value==='TUIC-demo')
     const passwordField=form.querySelector('#otuicpassword'),filled=passwordField&&passwordField.value===password&&form.querySelector('#ou').value===uuid&&form.querySelector('#ot').dataset.v==='tuic'
     if(!filled){await __close();return {'TUIC解析填表且UUID密码分开':false}}

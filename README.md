@@ -155,6 +155,8 @@ Mihomo 的 TUIC `disable-sni: true` 实际会同时跳过证书校验，因此�
 
 TUIC 基础分享链接保留 UUID、密码、SNI、ALPN、拥塞控制与证书校验选项。通用 URI 没有已验证的心跳、`quic` UDP 中继、0-RTT 或禁用 SNI 表达；存在这些非默认设置时，默认不生成可能丢配置的分享链接，可明确确认“复制基础链接”，或直接使用 Clash / sing-box 完整订阅。原参数始终保留。Shadowrocket 原生 conf 的 TUIC 转换尚未验证，不下发该协议。
 
+TUIC 分享导入兼容分别编码凭据和 [v2rayN 的整段编码方式](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Handler/Fmt/BaseFmt.cs)：`UUID:密码` 整体百分号解码一次后，只按第一个冒号分开；密码中剩余的冒号、加号、空格和字面百分号编码保持原样，不会误把整段凭据当成 UUID。
+
 字段在保存、重新打开和支持该字段的订阅格式中保持一致。VMess 按 [v2rayN 官方分享格式](https://github.com/2dust/v2rayN/wiki/Description-of-VMess-share-link)识别 `insecure`、`vcn`、`pcs`；AnyTLS 省略端口时使用官方默认的 443。未知附加字段不再阻断整条链接，会保留在「导入扩展字段」中、随保存和再次编辑保留，并在完整配置兼容提示中列出。原始分享链接导出保留这些扩展参数；尚未实现的连接参数不代表已生效，请按提示选择适合的客户端。无效必填字段、非法安全模式和不完整认证仍会明确报错，不会靠默认选项悄悄改写。旧 VLESS / Hysteria2 记录不在读取或保存其他节点时迁移；原有节点标识和订阅 token 不变。
 
 VLESS 的协议加密字段是 `encryption`，VMess 的加密方式来自 `scy`，均与传输路径分开保存。WebSocket 路径缺少前导 `/` 时，按 Xray 的规则补齐；路径内已有的百分号编码不做二次解码。
