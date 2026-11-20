@@ -3310,6 +3310,23 @@ async function apiRoute(req, url, event) {
   if (p === '/api/own') {
     if (req.method === 'POST') {
       const b = await req.json().catch(() => ({}))
+      if (b.act === 'reorder') {
+        if (!Array.isArray(b.order) || !Array.isArray(b.expectedOrder)) return json({ ok:false, msg:'排序数据格式错误，请刷新后重试' }, 400)
+        let previous
+        // A failed authoritative read must never turn sorting into a write of default nodes.
+        try { previous = await CONF.get('nodes', 'json') } catch (error) { return json({ ok:false, msg:'读取节点失败，排序未保存，请稍后重试' }, 503) }
+        if (previous === null || previous === undefined) previous = DEFAULT_NODES
+        if (!previous || typeof previous !== 'object' || Array.isArray(previous)) return json({ ok:false, msg:'节点数据异常，排序未保存' }, 503)
+        const keys = Object.keys(previous)
+        if (JSON.stringify(keys) !== JSON.stringify(b.expectedOrder)) return json({ ok:false, msg:'节点列表或顺序已变化，请刷新后重新排序' }, 409)
+        if (b.order.length !== keys.length || new Set(b.order).size !== keys.length || b.order.some(k => typeof k !== 'string' || BAD_KEYS.has(k) || !Object.prototype.hasOwnProperty.call(previous, k))) return json({ ok:false, msg:'排序必须包含且仅包含当前全部节点' }, 400)
+        const next = Object.fromEntries(b.order.map(k => [k, previous[k]]))
+        if (JSON.stringify(Object.keys(next)) !== JSON.stringify(b.order)) return json({ ok:false, msg:'旧节点的纯数字标识无法保存此顺序，当前节点未修改' }, 400)
+        if (JSON.stringify(keys) !== JSON.stringify(b.order)) {
+          try { await kvPut('nodes', next) } catch (error) { return json({ ok:false, msg:'保存节点顺序失败，请稍后重试' }, 503) }
+        }
+        return json({ ok:true, order:b.order })
+      }
       // 「恢复默认」就是清空。以前它直接删 KV，绕过了下面的悬空引用检查 ——
       // 策略还指着某个自有节点，节点却没了，订阅里那组就静默回落到「节点选择」
       if (b.act === 'reset') b.own = {}
@@ -4793,6 +4810,24 @@ function ownHeaderRows(n) {
   return rows
 }
 
+function ownWarningGroups(warnings) {
+  const nodes = new Map(), groups = new Map()
+  for (const w of warnings) {
+    const key = JSON.stringify([w.name, w.field, w.reason])
+    if (!nodes.has(key)) nodes.set(key, { name:w.name, field:w.field, reason:w.reason, formats:new Set() })
+    nodes.get(key).formats.add(w.format)
+  }
+  const clients = ['clash','singbox','shadowrocket','share']
+  const rank = format => clients.includes(format) ? clients.indexOf(format) : clients.length
+  for (const w of nodes.values()) {
+    const formats = [...w.formats].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
+    const key = JSON.stringify([w.field, w.reason, formats])
+    if (!groups.has(key)) groups.set(key, { names:[], field:w.field, reason:w.reason, formats })
+    groups.get(key).names.push(w.name)
+  }
+  return [...groups.values()]
+}
+
 function collectOwnHeaders(rows, host = '') {
   const bad = (err, row = 0) => ({ err, row })
   if (!Array.isArray(rows) || rows.length > 31) return bad('最多设置 30 个其他请求头，另可设置 Host')
@@ -4893,6 +4928,114 @@ function applyOwnECH(draft, original, value, acknowledged = false) {
     if (vmess) n.importExtras.vmess = { ...(n.importExtras.vmess || {}), ech: value }
   }
   return { node: n }
+}
+
+function installOwnListSorting() {
+  let cancelCurrent = null
+  window.bindOwnSort = () => {
+    if (cancelCurrent) cancelCurrent()
+    const list = document.querySelector('.uplist.own')
+    if (!list || list.__ownSortBound) return
+    list.__ownSortBound = true
+    const interactive = target => target.closest('button,a,input,textarea,select,[role="button"],[contenteditable]')
+    let state = null, suppressClick = false
+    const rows = () => [...list.querySelectorAll('.up.own')]
+    const restore = order => order.forEach(row => list.appendChild(row))
+    const moveTo = (x, y) => {
+      const target = document.elementFromPoint(x, y)?.closest('.up.own')
+      if (!target || target === state.row || target.parentElement !== list) return
+      const rect = target.getBoundingClientRect(), ref = y > rect.top + rect.height / 2 ? target.nextSibling : target
+      if (ref !== state.row && ref !== state.row.nextSibling) list.insertBefore(state.row, ref)
+    }
+    const persist = async originalRows => {
+      const expectedOrder = originalRows.map(row => row.dataset.key), order = rows().map(row => row.dataset.key)
+      if (JSON.stringify(order) === JSON.stringify(expectedOrder)) return
+      list.classList.add('own-order-busy'); list.inert = true; list.setAttribute('aria-busy', 'true')
+      try {
+        const result = await api('/api/own', {act:'reorder',order,expectedOrder})
+        if (!result.ok) { restore(originalRows); toast(result.msg || '节点顺序保存失败', true); return }
+        if (list.isConnected && OWN?.own) {
+          OWN = { ...OWN, own:Object.fromEntries(order.map(key => [key, OWN.own[key]])) }
+          const card = document.getElementById('owncard')
+          card.innerHTML = ownCardInner(); bindOwnSort()
+        } else OWN = null
+        POL = null; PRF = null
+        toast('节点顺序已保存')
+      } finally {
+        list.classList.remove('own-order-busy'); list.inert = false; list.removeAttribute('aria-busy')
+      }
+    }
+    const finish = cancelled => {
+      if (!state) return
+      const current = state; state = null
+      clearTimeout(current.timer); cancelAnimationFrame(current.frame)
+      for (const [type, handler] of current.listeners) document.removeEventListener(type, handler, true)
+      window.removeEventListener('blur', current.cancel)
+      current.row.classList.remove('tdrag'); list.classList.remove('own-sorting')
+      cancelCurrent = null
+      if (current.active) {
+        suppressClick = true
+        setTimeout(() => { suppressClick = false }, 0)
+        if (cancelled || !list.isConnected) restore(current.order)
+        else void persist(current.order)
+      }
+    }
+    const begin = (event, touch) => {
+      if (state) { if (touch && event.touches.length !== 1) finish(true); return }
+      if (list.inert || interactive(event.target) || (!touch && (event.pointerType === 'touch' || event.button !== 0))) return
+      if (touch && event.touches.length !== 1) return
+      const row = event.target.closest('.up.own')
+      if (!row || row.parentElement !== list || rows().length < 2) return
+      const point = touch ? event.touches[0] : event
+      if (!touch) event.preventDefault()
+      const current = state = {row,order:rows(),active:false,moved:false,startX:point.clientX,startY:point.clientY,x:point.clientX,y:point.clientY,id:touch ? point.identifier : event.pointerId,listeners:[]}
+      const cancel = () => finish(true)
+      current.cancel = cancel; cancelCurrent = cancel
+      const listen = (type, handler, passive = true) => { document.addEventListener(type, handler, {capture:true,passive}); current.listeners.push([type,handler]) }
+      const autoScroll = () => {
+        if (state !== current || !current.active) return
+        const dy = current.y < 60 ? -10 : current.y > innerHeight - 60 ? 10 : 0
+        if (dy && current.moved) { window.scrollBy(0,dy); moveTo(current.x,current.y) }
+        current.frame = requestAnimationFrame(autoScroll)
+      }
+      current.timer = setTimeout(() => {
+        if (state !== current || !list.isConnected || document.hidden) return cancel()
+        current.active = true; row.classList.add('tdrag'); list.classList.add('own-sorting')
+        current.frame = requestAnimationFrame(autoScroll)
+      }, 500)
+      const move = ev => {
+        if (state !== current) return
+        const p = touch ? [...ev.touches].find(t => t.identifier === current.id) : ev
+        if (!p || touch && ev.touches.length !== 1) return cancel()
+        if (!touch && ev.pointerId !== current.id) return
+        if (!current.active) {
+          if (Math.hypot(p.clientX-current.x,p.clientY-current.y) > 8) cancel()
+          return
+        }
+        if (!list.isConnected) return cancel()
+        if (ev.cancelable) ev.preventDefault()
+        current.x = p.clientX; current.y = p.clientY
+        if (Math.hypot(current.x-current.startX,current.y-current.startY) > 8) current.moved = true
+        if (current.moved) moveTo(current.x,current.y)
+      }
+      listen(touch ? 'touchmove' : 'pointermove', move, false)
+      listen(touch ? 'touchend' : 'pointerup', ev => {
+        if (!(touch ? [...ev.changedTouches].some(t => t.identifier === current.id) : ev.pointerId === current.id)) return
+        if (touch && current.active && ev.cancelable) ev.preventDefault()
+        finish(false)
+      }, false)
+      listen(touch ? 'touchcancel' : 'pointercancel', cancel)
+      listen('keydown', ev => { if (ev.key === 'Escape') { if (ev.cancelable) ev.preventDefault(); cancel() } }, false)
+      listen('scroll', () => { if (state && !current.active) cancel() })
+      listen('visibilitychange', () => { if (document.hidden) cancel() })
+      window.addEventListener('blur', cancel)
+    }
+    list.addEventListener('pointerdown', event => begin(event, false))
+    list.addEventListener('touchstart', event => begin(event, true), {passive:true})
+    list.addEventListener('contextmenu', event => { if (state && !interactive(event.target)) event.preventDefault() })
+    list.addEventListener('click', event => { if (suppressClick) { event.preventDefault(); event.stopPropagation() } }, true)
+    list.addEventListener('dragstart', event => { if (!interactive(event.target)) event.preventDefault() })
+  }
 }
 
 // Installed into the existing page scope; keeping this as JS avoids nested-template escaping bugs.
@@ -6581,6 +6724,10 @@ code{background:var(--bg);border:1px solid var(--bd2);border-radius:5px;padding:
 .uplist.lib{grid-template-columns:minmax(0,auto) minmax(0,1fr) auto auto auto}
 .uplist > .blank,.uplist > .empty{grid-column:1/-1}
 .pol.tdrag,.up.tdrag{box-shadow:var(--shP);background:var(--card);border-color:var(--accBd);position:relative;z-index:3}
+.uplist.own .up{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+.uplist.own.own-sorting,.uplist.own.own-sorting .up{cursor:grabbing}
+.uplist.own.own-order-busy{opacity:.7}
+.compat-warning{overflow-wrap:anywhere}
 .up{grid-column:1/-1;display:grid;grid-template-columns:subgrid;align-items:center;gap:11px;padding:10px 12px;border:1px solid var(--bd2);border-radius:10px;transition:border-color .16s var(--e),background .16s var(--e)}
 .up:hover{border-color:var(--bd);background:var(--hov)}
 .up .nm{font-weight:550;font-size:13.5px;white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
@@ -7683,7 +7830,7 @@ async function dash(skip){
   paintHeader()
   document.getElementById('body').innerHTML =
     TAB === 'node' ? viewNode() : TAB === 'sub' ? viewSub() : TAB === 'pol' ? viewPol() : TAB === 'lib' ? viewLib() : viewSet()
-  if (TAB === 'node') { bindDrag('.uplist.src', '.up', persistUpOrder); if (NQ || NF !== 'all') filterNodes(NQ) }
+  if (TAB === 'node') { bindDrag('.uplist.src', '.up', persistUpOrder); bindOwnSort(); if (NQ || NF !== 'all') filterNodes(NQ) }
   if (TAB === 'pol') {
     bindDrag('#pollist', '.pol', persistOrder)
     const sel = document.getElementById('pfsel')
@@ -7759,7 +7906,7 @@ function viewNode(){
   return h + '<div class="foot anim" style="animation-delay:.14s">节点每小时自动刷新，上游故障时沿用缓存</div>'
 }
 
-const protoName = n => n.type === 'vless' ? ('VLESS ' + (n.security === 'reality' || (n.security === undefined && n.net !== 'ws') ? 'Reality' : (n.net || 'tcp').toUpperCase())) : ({hysteria2:'Hysteria2',ss:'Shadowsocks',vmess:'VMess',anytls:'AnyTLS'}[n.type] || n.type)
+const protoName = n => n.type === 'vless' ? ('VLESS ' + (n.security === 'reality' || (n.security === undefined && n.net !== 'ws') ? 'Reality' : (n.net || 'tcp').toUpperCase())) : ({hysteria2:'Hysteria2',ss:'Shadowsocks',vmess:'VMess',anytls:'AnyTLS',tuic:'TUIC v5'}[n.type] || n.type)
 function ownCardInner(){
   const ow = (OWN && OWN.own) || {}
   let h = \`<div class="ttl">自有节点<span class="sub">自建服务器</span><span class="sp">
@@ -7769,10 +7916,10 @@ function ownCardInner(){
           <button type="button" role="menuitem" onclick="setOwnAddMenu(false);editOwn(null)">手动添加</button>
           <button type="button" role="menuitem" onclick="setOwnAddMenu(false);importOwnJSON()">批量导入 JSON</button>
         </span></span></span></span></div>
-    <div class="desc">与机场无关的自建节点，分流策略可以直接指向它们。</div>\`
+    <div class="desc">与机场无关的自建节点，分流策略可以直接指向它们。长按节点名称或空白区域可拖动排序。</div>\`
   if (OWN && !OWN.ok) return h + errHTML(OWN)
   h += '<div class="uplist own">'
-  h += Object.entries(ow).map(([k,n]) => \`<div class="up own">
+  h += Object.entries(ow).map(([k,n]) => \`<div class="up own" data-key="\${esc(k)}">
       <span class="dot"></span>
       <span class="nm">\${esc(n.name)}</span>
       <span class="tgt">\${esc(protoName(n))}</span>
@@ -7783,14 +7930,8 @@ function ownCardInner(){
     </div>\`).join('') || blankHTML('server', '还没有自有节点', '支持 VLESS、Hysteria2、Shadowsocks、VMess、AnyTLS、TUIC v5，按协议编辑连接参数。')
   h += '</div>'
   const warnings = Object.entries((OWN && OWN.compatibility) || {}).flatMap(([k, items]) => items.map(w => ({...w, name: (ow[k] || {}).name || k})))
-  const groups = new Map()
-  for (const w of warnings) {
-    const key = JSON.stringify([w.name, w.field, w.reason])
-    if (!groups.has(key)) groups.set(key, { ...w, formats:[] })
-    const label = (CLIENTS.find(c => c.k === w.format) || {}).label || w.format
-    if (!groups.get(key).formats.includes(label)) groups.get(key).formats.push(label)
-  }
-  if (groups.size) h += '<details class="fg"><summary class="lb" style="cursor:pointer">客户端兼容提示（' + groups.size + '）</summary><div class="hint">' + [...groups.values()].map(w => '<div class="compat-warning">' + esc(w.name + ' · ' + w.formats.join(' / ') + '：' + w.reason) + '</div>').join('') + '</div></details>'
+  const groups = ownWarningGroups(warnings)
+  if (groups.length) h += '<details class="fg"><summary class="lb" style="cursor:pointer">客户端兼容提示（' + groups.length + '）</summary><div class="hint">' + groups.map(w => '<div class="compat-warning">' + esc(w.names.join('、') + '：' + w.formats.map(format => (CLIENTS.find(c => c.k === format) || {}).label || format).join(' / ') + '：' + w.reason) + '</div>').join('') + '</div></details>'
   return h
 }
 
@@ -8916,7 +9057,8 @@ ${"const parseOwnJSON = (() => {\n" + [
   'return parseOwnJSON'
 ].join(';\n') + '\n})();'}
 ${"(" + installOwnJSONUI.toString() + ")();"}
-${[ownHeaderRows, collectOwnHeaders, ownECHState, applyOwnECH].map(fn => fn.toString()).join(';\n')}
+${[ownHeaderRows, collectOwnHeaders, ownECHState, applyOwnECH, ownWarningGroups].map(fn => fn.toString()).join(';\n')}
+${"(" + installOwnListSorting.toString() + ")();"}
 ${"(" + installOwnEditor.toString().replace(/\n  /g, '\n') + ")();"}
 ${"(" + installLocalFetchClient.toString() + ")();"}
 

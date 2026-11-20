@@ -144,6 +144,12 @@ Clash Reality 的 `reality-opts.support-x25519mlkem768` 支持布尔值导入、
 
 WS / HTTPUpgrade 请求头使用多行“名称下拉 + 内容”编辑，可同时添加 Host、User-Agent、Origin 等，也支持自定义名称和删除行。导入的已有请求头自动填入，内容空格保留；名称不区分大小写，重复或非法名称会阻止保存，不会覆盖其他行。WS 的 Host 只保留一个可见编辑入口，与节点 Host 字段同步。请求头内容可能包含敏感凭据，不要截图外发。
 
+自有节点列表中的 TUIC 标签统一显示为 `TUIC v5`。客户端兼容提示按“相同参数、相同提示内容、完全相同客户端组合”合并节点名称，例如 `A、B：Clash / sing-box：提示内容`；客户端范围不同的提示不会混在一起，实际订阅兼容处理不变。
+
+电脑和手机均可长按自有节点名称或空白区域约半秒后拖动排序，松手保存，刷新后保留。普通滑动仍滚动页面；复制、编辑、删除按钮不触发拖动。未移动、提前滑动取消、触控中断或按 Esc 取消都不保存；失败会提示并还原显示顺序。只有实际换序后才提交一次排序请求、写入一次 `nodes`，不改变节点标识、参数或订阅地址，不需要付费功能。请求只传节点标识顺序，服务端使用当前保存的节点值；列表或顺序已被其他页面改变时拒绝旧排序，提示刷新。Workers KV 不提供事务，不建议在多个管理页同时修改配置。
+
+历史备份中纯数字节点标识可能受 JSON 对象的数字键顺序限制；无法忠实保存的次序会明确报错，不自动改标识或伪报保存成功。正常由编辑器自动生成的节点标识不受此限制。
+
 ALPN 提供默认、`h3`、`h2`、`http/1.1`、`h3,h2`、`h2,http/1.1`、`h3,h2,http/1.1` 和自定义选项。这些是常用组合，不是全部合法值；导入其他值或不同顺序时自动进入自定义，保留原顺序，不强行替换为预设。实际选择应与服务端配置匹配。
 
 - **VLESS**：TLS / Reality、Flow、Encryption、TCP / WS / HTTPUpgrade / gRPC / H2 / XHTTP、路径、Host、ServiceName、指纹、ALPN 与 UDP 包编码。
@@ -263,6 +269,7 @@ node --test test/yaml-multi.cjs                 # 多节点单行 YAML 缩进与
 node --test test/compatibility-mode.cjs test/ech-mapping.cjs # 兼容模式、ECH 映射及保密边界回归
 node --test test/ech-share.cjs                  # VLESS ECH 双导入路径、编码与只读分享回归
 node --test test/editor-fields.cjs              # 多行请求头、独立 ECH、旧字段保留与安全校验回归
+node --test test/own-list.cjs                   # 节点排序只改顺序、冲突保护与提示分组回归
 node --test test/reality-pq.cjs                 # Reality 能力开关、三态及跨格式身份保留回归
 node --test test/tuic.cjs                       # TUIC v5 导入、编辑、格式转换与证书校验边界回归
 node --test test/import-compatibility.cjs       # 官方分享链接字段与扩展参数导入回归
@@ -270,6 +277,7 @@ node --test test/encryption-path.cjs            # 加密字段、路径编码与
 node --test test/security-hardening.cjs         # HTTPS、权威状态故障关闭与诊断最小输出回归
 node --test test/local-network.cjs              # 本地模式、CSP、快照写入、冲突与浏览器消息流程回归
 node test/e2e.mjs                               # 端到端：在无头 Chrome 里把管理端完整点一遍（需本机有 Chrome）
+node test/own-list-e2e.mjs                     # 桌面 / 手机长按排序、取消、刷新保留与提示显示
 node --test test/demo-build.cjs                 # 演示页生成不受 Windows / Linux 换行差异影响
 node scripts/build-demo.mjs                     # 重新生成 docs/demo.html
 node scripts/shots.mjs                          # 重新生成 README 截图
