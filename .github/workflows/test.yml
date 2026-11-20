@@ -23,5 +23,6 @@ jobs:
         run: node test/e2e.mjs
       - name: 演示页与源码同步
         run: |
+          node --test test/demo-build.cjs
           node scripts/build-demo.mjs
           git diff --stat --exit-code docs/demo.html || (echo "docs/demo.html 过期了：改完 worker.js 请运行 node scripts/build-demo.mjs" && exit 1)

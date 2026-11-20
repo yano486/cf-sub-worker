@@ -14,7 +14,8 @@ import { fileURLToPath } from 'node:url'
 import { FEEDS, seedData } from '../dev/fixtures.mjs'
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
-const SRC = fs.readFileSync(path.join(ROOT, 'worker.js'), 'utf8')
+// The embedded source and YAML fixtures must be identical across Git checkout line endings.
+const SRC = fs.readFileSync(path.join(ROOT, 'worker.js'), 'utf8').replace(/\r\n?/g, '\n')
 // DEMO_OUT：端到端测试用，生成到临时位置，不动 docs/ 里的正式文件
 const OUT = process.env.DEMO_OUT || path.join(ROOT, 'docs', 'demo.html')
 const ORIGIN = 'https://sub.example.com'
@@ -27,7 +28,7 @@ let html = ctx.adminHTML(true, true)
 // JSON 放进 <script> 里：</script 和 <!-- 会提前结束或打乱脚本块，必须转义
 const inline = v => JSON.stringify(v).replace(/<\/(script)/gi, '<\\/$1').replace(/<!--/g, '<\\!--')
 const feeds = {}
-for (const [k, f] of Object.entries(FEEDS)) feeds[k] = { status: f.status || 200, type: f.type, usage: f.usage || null, body: f.body() }
+for (const [k, f] of Object.entries(FEEDS)) feeds[k] = { status: f.status || 200, type: f.type, usage: f.usage || null, body: f.body().replace(/\r\n?/g, '\n') }
 
 const shim = `<script id="demo">
 /* 演示模式：Worker 跑在页面里。见 scripts/build-demo.mjs */

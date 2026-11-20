@@ -270,6 +270,7 @@ node --test test/encryption-path.cjs            # 加密字段、路径编码与
 node --test test/security-hardening.cjs         # HTTPS、权威状态故障关闭与诊断最小输出回归
 node --test test/local-network.cjs              # 本地模式、CSP、快照写入、冲突与浏览器消息流程回归
 node test/e2e.mjs                               # 端到端：在无头 Chrome 里把管理端完整点一遍（需本机有 Chrome）
+node --test test/demo-build.cjs                 # 演示页生成不受 Windows / Linux 换行差异影响
 node scripts/build-demo.mjs                     # 重新生成 docs/demo.html
 node scripts/shots.mjs                          # 重新生成 README 截图
 bash deploy.sh                                  # 部署
