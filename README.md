@@ -1,8 +1,8 @@
 # cf-sub-worker
 
-本仓库基于 [kittors/cf-sub-worker](https://github.com/kittors/cf-sub-worker)，保留原有聚合与分流功能，增加五协议可视化编辑、浏览器本地网络拉取、表单样式统一和安全加固。
+本仓库基于 [kittors/cf-sub-worker](https://github.com/kittors/cf-sub-worker)，保留原有聚合与分流功能，增加六协议可视化编辑、浏览器本地网络拉取、表单样式统一和安全加固。
 
-相比原版，主要增加了可在线编辑vless、hy2、ss、vmess、anytls功能，并支持json批量导入，对自建节点编辑相对友好
+相比原版，主要增加了可在线编辑vless、hy2、ss、vmess、anytls、tuic功能，并支持json批量导入，对自建节点编辑相对友好
 
 
 ## 部署
@@ -90,11 +90,11 @@ KV_NAMESPACE_ID=... bash deploy.sh    # 明确指定 KV namespace
 
 自有节点右上角使用同一个“添加 ▾”按钮：电脑支持鼠标悬停或点击展开，手机点击展开，可选“手动添加”或“批量导入 JSON”。添加、编辑单个节点时，弹窗左下角的“编辑 JSON”会加载当前表单草稿；解析后只填回表单，仍需点击“保存”才会写入。
 
-自动识别编辑器 JSON 对象 / 数组、Clash / Mihomo JSON 或常见 YAML、Xray 与 sing-box 出站节点、`outbounds` / `proxies` 片段及完整配置。无需补齐完整外壳；结构末尾的多余逗号会安全处理，字符串里的逗号不改动。输入框上方按格式列出 SS、VLESS、VMess、HY2、AnyTLS 的只读结构示例，仅展示对应内核真实支持的组合。完整配置只提取节点，不导入路由、DNS 或入站设置。批量导入只新增节点，不覆盖现有节点；重名会提示修改，不会自动替换。
+自动识别编辑器 JSON 对象 / 数组、Clash / Mihomo JSON 或常见 YAML、Xray 与 sing-box 出站节点、`outbounds` / `proxies` 片段及完整配置。无需补齐完整外壳；结构末尾的多余逗号会安全处理，字符串里的逗号不改动。输入框上方按格式列出 SS、VLESS、VMess、HY2、AnyTLS、TUIC v5 的只读结构示例，仅展示对应内核真实支持的组合（Xray 不含 TUIC）。完整配置只提取节点，不导入路由、DNS 或入站设置。批量导入只新增节点，不覆盖现有节点；重名会提示修改，不会自动替换。
 
 每批最多 100 个节点、256 KiB UTF-8、16 层嵌套。解析和预览在浏览器本地进行，不请求上游；批量保存沿用节点保存接口，一批写入一次 `nodes`，不是每个节点各写一次。保存和界面刷新仍占用正常的 Worker 请求与 KV 读写额度，不需要付费功能。
 
-基础字段映射到当前五协议编辑器，已识别的 ECH、Xray `finalmask` 和 sing-box TLS 分片字段原样保存在“客户端专用参数”中。sing-box 分片参数会随 sing-box 完整配置下发；不能等效表达这些参数的输出格式会提示并剔除整条节点及其分组引用，而不是去掉参数后强行连接。未知或不支持的连接字段仍按节点序号和原始路径报错，整批不保存。已关闭的复用、导出器冗余默认字段，以及非代理出站会明确列为未导入项。
+基础字段映射到当前六协议编辑器，已识别的 ECH、Xray `finalmask` 和 sing-box TLS 分片字段原样保存在“客户端专用参数”中。sing-box 分片参数会随 sing-box 完整配置下发；不能等效表达这些参数的输出格式会提示并剔除整条节点及其分组引用，而不是去掉参数后强行连接。未知或不支持的连接字段仍按节点序号和原始路径报错，整批不保存。已关闭的复用、导出器冗余默认字段，以及非代理出站会明确列为未导入项。
 
 Clash YAML 使用本地安全子集解析器，支持常见流式 / 块式节点、嵌套、引号和注释；多个单行节点可一起粘贴，兼容列表整体缩进和复制时首行缩进缺失。不支持标签、锚点、别名、合并、多文档及多行标量。不会执行输入内容，也不调用第三方转换服务。
 
@@ -108,7 +108,7 @@ Clash Reality 的 `reality-opts.support-x25519mlkem768` 支持布尔值导入、
 
 ### 基础兼容输出
 
-节点编辑的“高级配置”中，带客户端专用参数的节点可选择“基础兼容输出”。默认关闭：无法完整转换的格式仍不下发该节点。开启前会说明可能省略的参数、连接与隐私影响，确认后才启用；这项选择影响包含该节点的所有订阅，而不只是当前设备。
+节点编辑的“高级配置”中，带客户端专用参数或 TUIC 调优设置的节点可选择“基础兼容输出”。默认关闭：无法完整转换的格式仍不下发该节点。开启前会说明可能省略的参数、连接与隐私影响，确认后才启用；这项选择影响包含该节点的所有订阅，而不只是当前设备。
 
 开启后，仅省略当前格式不能表达的 ECH、`finalmask` 或 TLS 分片等专用设置，其余基础节点仍正常下发；证书校验、VLESS Encryption 和传输支持范围等其他限制不变。完整原参数保存在节点中，关闭即可恢复严格输出。不会自动修改已有节点，也不会自动为导入的外部配置开启。节点 JSON 使用 `compatibilityMode: "basic"` 或 `"strict"` 表示该选择；导入显式 `basic` 的 JSON 时仍需在界面确认。
 
@@ -145,6 +145,15 @@ Clash Reality 的 `reality-opts.support-x25519mlkem768` 支持布尔值导入、
 - **Shadowsocks**：加密方式（含 SS2022）、密码 / 密钥、UDP-over-TCP、simple-obfs / v2ray-plugin 的可视化参数。SS2022 密钥会检查 Base64 和长度。
 - **VMess**：UUID、加密方式、AlterID、TLS、传输、WS 请求头与 Early Data。
 - **AnyTLS**：密码、TLS、SNI、ALPN、指纹和空闲会话池参数。
+- **TUIC v5**：UUID 与独立密码、SNI、ALPN、证书校验、`cubic` / `new_reno` / `bbr` 拥塞控制、`native` / `quic` UDP 中继、心跳间隔、0-RTT 和禁用 SNI。支持 `tuic://`、Clash JSON / YAML、sing-box JSON 及出站片段；不把 v4 token 或 Xray 出站猜成 TUIC v5。
+
+TUIC 字段按 [Mihomo 文档](https://wiki.metacubex.one/config/proxies/tuic/)和 [sing-box 文档](https://sing-box.sagernet.org/configuration/outbound/tuic/)映射。心跳在编辑器中使用整数毫秒，导入 sing-box 的 `1.5s` 等时长会换算为 `1500`，导出回 `1500ms`，不会误作秒。0-RTT 默认不主动开启，启用可能增加重放风险。QUIC 不使用 TCP uTLS 指纹或 TLS 记录分片；尚未支持的 UDP-over-stream、UDP-only 网络和其他客户端调优字段会明确拒绝，不能认为已无损导入。
+
+Clash TUIC 的 ALPN 缺省时按 Mihomo 的 `h3` 保存，并明确写入分享链接及 sing-box 输出。sing-box 没有相同默认值，因此缺省 ALPN 的 TUIC sing-box 配置、以及任何显式空 ALPN 数组暂不导入，提示核对服务端填写实际列表，不会猜测补值；这是当前编辑器的支持范围，不代表此类配置在所有内核中都无效。新建节点默认填入 `h3`，图形表单留空时也明确显示使用 `h3` 的提示。如服务端使用其他 ALPN，请填写实际值。
+
+Mihomo 的 TUIC `disable-sni: true` 实际会同时跳过证书校验，因此导入时会记录这一风险并弹出已有的“已了解”告知。sing-box 的 `tls.disable_sni: true` 可以仍保留证书校验：这种安全要求不会被自动改成 Mihomo 的不安全行为，Clash 输出会剔除节点和对应分组引用，基础兼容模式也不能绕过。TUIC 的 TCP-only 设置同样仅在 sing-box 完整配置中下发，不能用 Mihomo 忽略的 `udp: false` 假装关闭 UDP。
+
+TUIC 基础分享链接保留 UUID、密码、SNI、ALPN、拥塞控制与证书校验选项。通用 URI 没有已验证的心跳、`quic` UDP 中继、0-RTT 或禁用 SNI 表达；存在这些非默认设置时，默认不生成可能丢配置的分享链接，可明确确认“复制基础链接”，或直接使用 Clash / sing-box 完整订阅。原参数始终保留。Shadowrocket 原生 conf 的 TUIC 转换尚未验证，不下发该协议。
 
 字段在保存、重新打开和支持该字段的订阅格式中保持一致。VMess 按 [v2rayN 官方分享格式](https://github.com/2dust/v2rayN/wiki/Description-of-VMess-share-link)识别 `insecure`、`vcn`、`pcs`；AnyTLS 省略端口时使用官方默认的 443。未知附加字段不再阻断整条链接，会保留在「导入扩展字段」中、随保存和再次编辑保留，并在完整配置兼容提示中列出。原始分享链接导出保留这些扩展参数；尚未实现的连接参数不代表已生效，请按提示选择适合的客户端。无效必填字段、非法安全模式和不完整认证仍会明确报错，不会靠默认选项悄悄改写。旧 VLESS / Hysteria2 记录不在读取或保存其他节点时迁移；原有节点标识和订阅 token 不变。
 
@@ -246,6 +255,7 @@ node --test test/yaml-multi.cjs                 # 多节点单行 YAML 缩进与
 node --test test/compatibility-mode.cjs test/ech-mapping.cjs # 兼容模式、ECH 映射及保密边界回归
 node --test test/ech-share.cjs                  # VLESS ECH 双导入路径、编码与只读分享回归
 node --test test/reality-pq.cjs                 # Reality 能力开关、三态及跨格式身份保留回归
+node --test test/tuic.cjs                       # TUIC v5 导入、编辑、格式转换与证书校验边界回归
 node --test test/import-compatibility.cjs       # 官方分享链接字段与扩展参数导入回归
 node --test test/encryption-path.cjs            # 加密字段、路径编码与 WebSocket 路径归一回归
 node --test test/security-hardening.cjs         # HTTPS、权威状态故障关闭与诊断最小输出回归

@@ -1296,11 +1296,8 @@ function parseShareLineRaw(line) {
     if (/^\d+(-\d+)?(,\d+(-\d+)?)*$/.test(ports)) kv.ports = yq(ports)         // 端口跳跃
   } else if (scheme === 'tuic') {
     Object.assign(kv, { type: 'tuic', server: yq(host), port, uuid: yq(user), password: yq(safeDecode(u.password)), udp: 'true' })
-    if (q.sni) kv.sni = yq(q.sni)
+    shareTLS(kv, { ...q, security: 'tls' }, 'sni')
     if (q.congestion_control) kv['congestion-controller'] = yq(q.congestion_control)
-    const alpn = q.alpn ? safeDecode(q.alpn).split(',').map(s => s.trim()).filter(Boolean) : []
-    if (alpn.length) kv.alpn = yqList(alpn)
-    if (q.allow_insecure === '1' || q.insecure === '1') kv['skip-cert-verify'] = 'true'
   } else if (scheme === 'anytls') {
     if (!whole) return null
     Object.assign(kv, { type: 'anytls', server: yq(host), port, password: yq(whole), udp: 'true' })
@@ -1683,7 +1680,7 @@ function triesMsg(tries) {
   return parts.join('；')
 }
 
-const OWN_TYPES = ['vless', 'hysteria2', 'ss', 'vmess', 'anytls']
+const OWN_TYPES = ['vless', 'hysteria2', 'ss', 'vmess', 'anytls', 'tuic']
 const OWN_NETS = ['tcp', 'ws', 'httpupgrade', 'grpc', 'h2', 'http', 'xhttp']
 const OWN_SS_METHODS = ['aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm', 'chacha20-ietf-poly1305', 'xchacha20-ietf-poly1305',
   '2022-blake3-aes-128-gcm', '2022-blake3-aes-256-gcm', '2022-blake3-chacha20-poly1305',
@@ -1699,7 +1696,7 @@ function ownSecurity(n) {
 
 const IMPORT_VMESS_FIELDS = new Set(['v','ps','remark','add','port','id','aid','scy','security','net','type','host','path','tls','sni','fp','alpn','insecure','allowInsecure','vcn','pcs','mode','headers','packetEncoding','serviceName'])
 const IMPORT_QUERY_COMMON = ['sni','peer','fp','alpn','insecure','allowInsecure','allow_insecure','skip-cert-verify','udp','vcn','verifyName','pcs','pinSHA256']
-const IMPORT_QUERY_BYTYPE = { vless:['encryption','flow','security','tls','type','net','path','host','serviceName','servicename','mode','pbk','sid','headerType','packetEncoding'], vmess:['encryption','security','tls','type','net','path','host','serviceName','servicename','mode','headerType','aid','scy','packetEncoding'], hysteria2:['obfs','obfs-password','mport'], ss:['plugin','udp'], anytls:[] }
+const IMPORT_QUERY_BYTYPE = { vless:['encryption','flow','security','tls','type','net','path','host','serviceName','servicename','mode','pbk','sid','headerType','packetEncoding'], vmess:['encryption','security','tls','type','net','path','host','serviceName','servicename','mode','headerType','aid','scy','packetEncoding'], hysteria2:['obfs','obfs-password','mport'], ss:['plugin','udp'], anytls:[], tuic:['congestion_control'] }
 const IMPORT_PLUGIN_FIELDS = new Set(['mode','host','path','tls','mux','obfs','obfs-host'])
 const reservedImportQuery = (type,key) => ((type !== 'ss' && IMPORT_QUERY_COMMON.includes(key)) || (IMPORT_QUERY_BYTYPE[type] || []).includes(key)) && !(type === 'hysteria2' && key === 'fp')
 function validateImportExtras(value, type) {
@@ -1736,6 +1733,7 @@ function validateClientOptions(value, type, security) {
     if (security === 'none') return false
     if (!allowed(value.singbox, ['tls']) || !allowed(value.singbox.tls, ['fragment','record_fragment','fragment_fallback_delay']) || !Object.keys(value.singbox.tls).length) return false
     const tls = value.singbox.tls
+    if (type === 'tuic' && Object.values(tls).some(v => v !== false)) return false
     for (const key of ['fragment','record_fragment']) if (tls[key] !== undefined && typeof tls[key] !== 'boolean') return false
     if (tls.fragment_fallback_delay !== undefined) {
       if (typeof tls.fragment_fallback_delay !== 'string') return false
@@ -1859,6 +1857,12 @@ function ownShareECH(n) {
 
 function unsupportedClientFields(n, format) {
   const missing = []
+  if (n.type === 'tuic' && format === 'share') {
+    if (n.udpRelayMode === 'quic') missing.push('TUIC UDP 中继模式')
+    if (n.heartbeatInterval !== undefined && n.heartbeatInterval !== 10000) missing.push('TUIC 心跳间隔')
+    if (n.zeroRtt) missing.push('TUIC 0-RTT')
+    if (n.disableSni) missing.push('TUIC 禁用 SNI')
+  }
   const options = n.clientOptions || {}, xray = options.xray
   if (xray) {
     if (Object.keys(xray).some(k => !['tlsSettings','finalmask'].includes(k))) missing.push('Xray 专用选项')
@@ -1923,7 +1927,7 @@ function normalizeOwnNode(v) {
     const options = compactClientOptions(v.clientOptions)
     if (Object.keys(options).length) n.clientOptions = options
   }
-  if (['hysteria2', 'anytls'].includes(n.type) && sec !== 'tls') return bad('该协议必须使用 TLS', 'security')
+  if (['hysteria2', 'anytls', 'tuic'].includes(n.type) && sec !== 'tls') return bad('该协议必须使用 TLS', 'security')
   if (sec === 'reality' && n.type !== 'vless') return bad('仅 VLESS 支持这里的 Reality 配置', 'security')
   for (const key of ['udp', 'insecure', 'uot']) if (v[key] !== undefined) {
     if (typeof v[key] !== 'boolean') return bad('开关字段必须是布尔值', key)
@@ -1932,7 +1936,7 @@ function normalizeOwnNode(v) {
   if (v.fp !== undefined) {
     n.fp = String(v.fp).trim()
     if (n.fp && n.fp !== 'none' && !SB_UTLS.has(n.fp)) return bad('不支持的客户端指纹', 'fp')
-    if (n.type === 'hysteria2' && n.fp && n.fp !== 'none') return bad('HY2 使用 QUIC，不支持 TCP uTLS 客户端指纹', 'fp')
+    if (['hysteria2', 'tuic'].includes(n.type) && n.fp && n.fp !== 'none') return bad('HY2 / TUIC 使用 QUIC，不支持 TCP uTLS 客户端指纹', 'fp')
   }
   if (v.alpn !== undefined) {
     if (!Array.isArray(v.alpn) || v.alpn.length > 16 || v.alpn.some(x => typeof x !== 'string' || !x || x.length > 128 || /[\s,\x00-\x1f\x7f]/.test(x))) return bad('ALPN 必须是协议名称列表', 'alpn')
@@ -2023,7 +2027,27 @@ function normalizeOwnNode(v) {
       if (n.ports && (!/^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(n.ports) || sbPorts(n.ports).length !== n.ports.split(',').length)) return bad('端口跳跃范围必须在 1-65535 内，且起点不大于终点', 'ports')
     }
   }
-  const numeric = n.type === 'hysteria2' ? ['hopInterval', 'upMbps', 'downMbps'] : n.type === 'anytls' ? ['idleCheck', 'idleTimeout', 'minIdle'] : ['earlyData']
+  if (n.type === 'tuic') {
+    if (v.alpn === undefined) n.alpn = ['h3']
+    else if (!n.alpn.length) return bad('当前 TUIC 编辑器暂不支持空 ALPN；请核对服务端并填写实际列表', 'alpn')
+    n.u = n.u.trim()
+    if (!/^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/.test(n.u)) return bad('TUIC v5 UUID 格式不正确；不支持 v4 token', 'u')
+    if (typeof v.password !== 'string' || v.password.length > 4096 || /[\x00-\x1f\x7f]/.test(v.password)) return bad('TUIC v5 密码必须是有效字符串（可为空）', 'password')
+    n.password = v.password
+    for (const [key, allowed] of [['congestionControl', ['cubic', 'new_reno', 'bbr']], ['udpRelayMode', ['native', 'quic']]]) if (v[key] !== undefined) {
+      if (!allowed.includes(v[key])) return bad('不支持的 TUIC 参数取值', key)
+      n[key] = v[key]
+    }
+    for (const key of ['zeroRtt', 'disableSni']) if (v[key] !== undefined) {
+      if (typeof v[key] !== 'boolean') return bad('TUIC 开关必须是 JSON 布尔值', key)
+      n[key] = v[key]
+    }
+    if (v.heartbeatInterval !== undefined) {
+      if (typeof v.heartbeatInterval !== 'number' || !Number.isInteger(v.heartbeatInterval) || v.heartbeatInterval < 1 || v.heartbeatInterval > 86400000) return bad('TUIC 心跳间隔必须是 1-86400000 的整数毫秒', 'heartbeatInterval')
+      n.heartbeatInterval = v.heartbeatInterval
+    }
+  }
+  const numeric = n.type === 'hysteria2' ? ['hopInterval', 'upMbps', 'downMbps'] : n.type === 'anytls' ? ['idleCheck', 'idleTimeout', 'minIdle'] : n.type === 'tuic' ? [] : ['earlyData']
   for (const key of numeric) if (v[key] !== undefined && v[key] !== '') {
     if (typeof v[key] !== 'number') return bad('数值字段必须是 JSON 数字', key)
     const x = Number(v[key]), min = ['minIdle', 'earlyData'].includes(key) ? 0 : 0.001
@@ -2058,6 +2082,11 @@ function ownToKv(n) {
       kv.cipher = yq(n.cipher || 'auto'); kv.alterId = String(n.alterId || 0)
       if (n.packetEncoding) kv['packet-encoding'] = n.packetEncoding
     }
+  } else if (n.type === 'tuic') {
+    kv.uuid = yq(n.u); kv.password = yq(n.password)
+    kv.sni = yq(n.sni || '')
+    if (n.alpn === undefined) kv.alpn = yqList(['h3'])
+    for (const [a, b] of [['congestionControl', 'congestion-controller'], ['udpRelayMode', 'udp-relay-mode'], ['heartbeatInterval', 'heartbeat-interval'], ['zeroRtt', 'reduce-rtt'], ['disableSni', 'disable-sni']]) if (n[a] !== undefined) kv[b] = typeof n[a] === 'string' ? yq(n[a]) : String(n[a])
   } else {
     kv.password = yq(n.u)
     if (n.type === 'ss') {
@@ -2080,7 +2109,7 @@ function ownToKv(n) {
   }
   if (sec !== 'none' && n.type !== 'ss') {
     const fp = n.fp === undefined ? (n.type === 'vless' ? 'chrome' : '') : n.fp
-    if (fp && n.type !== 'hysteria2') kv['client-fingerprint'] = yq(fp)
+    if (fp && !['hysteria2', 'tuic'].includes(n.type)) kv['client-fingerprint'] = yq(fp)
     if (n.verifyName) kv['name-cert-verify'] = yq(n.verifyName)
     if (n.certSha256) kv.fingerprint = yq(n.certSha256)
     if (n.alpn && n.alpn.length) kv.alpn = yqList(n.alpn)
@@ -2103,6 +2132,11 @@ function ownSRUnsafeField(n) {
 function ownCompatibility(n) {
   const out = [], add = (format, field, reason) => out.push({ format, field, reason })
   const net = n.net || 'tcp'
+  if (n.type === 'tuic') {
+    add('shadowrocket', 'type', 'TUIC 的 Shadowrocket 原生 conf 参数尚未验证，该格式不下发；请使用 TUIC 链接或 Clash / sing-box 完整配置。')
+    if (n.disableSni && !n.insecure) add('clash', 'disableSni', 'Mihomo 的 disable-sni 会同时关闭证书校验，无法保留当前安全要求；该格式不下发，不会自动弱化证书校验。')
+    if (n.udp === false) add('clash', 'udp', 'Mihomo TUIC 固定支持 UDP，不能用 udp:false 保留 TCP-only 限制；该格式不下发，请使用 sing-box 完整配置。')
+  }
   if (n.realityPQ !== undefined) for (const format of ['singbox','shadowrocket','share']) add(format, 'realityPQ', n.realityPQ
     ? '已保留标准 Reality 参数；Mihomo 的 X25519MLKEM768 允许开关未直接映射，密钥交换由目标客户端内核与指纹协商，不保证跨版本等效。'
     : '已保留标准 Reality 参数；此格式不能强制执行 Mihomo 的禁用 X25519MLKEM768 开关，密钥交换由客户端协商，请特别核对旧服务端兼容性。')
@@ -2169,7 +2203,7 @@ function shareToOwn(link) {
   if (!kv) return null
   const v = k => kv[k] === undefined ? '' : unquote(kv[k])
   const t = v('type')
-  if (!OWN_TYPES.includes(t)) return { err: `自有节点不支持 ${t}，请选择 VLESS / HY2 / SS / VMess / AnyTLS` }
+  if (!OWN_TYPES.includes(t)) return { err: `自有节点不支持 ${t}，请选择 VLESS / HY2 / SS / VMess / AnyTLS / TUIC v5` }
   const beforeFragment = String(link).split('#')[0], queryAt = beforeFragment.indexOf('?')
   const params = new URLSearchParams(queryAt < 0 ? '' : beforeFragment.slice(queryAt + 1))
   const supported = new Set([...(t === 'ss' ? [] : IMPORT_QUERY_COMMON), ...IMPORT_QUERY_BYTYPE[t]])
@@ -2227,6 +2261,10 @@ function shareToOwn(link) {
     }
     if (t === 'vless') { o.encryption = v('encryption') || 'none'; if (v('packet-encoding')) o.packetEncoding = v('packet-encoding') }
     else { o.cipher = v('cipher') || 'auto'; o.alterId = Number(v('alterId') || 0) }
+  } else if (t === 'tuic') {
+    o.u = v('uuid'); o.password = v('password'); o.security = 'tls'; o.sni = v('sni') || v('servername')
+    o.alpn = ['h3']
+    if (v('congestion-controller')) o.congestionControl = v('congestion-controller')
   } else {
     o.u = v('password')
     o.sni = v('sni') || v('servername')
@@ -3321,7 +3359,7 @@ async function apiRoute(req, url, event) {
     for (const [k, n] of Object.entries(own)) {
       try {
         links[k] = shareLink({ name: n.name, own: true, o: n }) || ''
-        if (!links[k] && n.clientOptions) basicLinks[k] = shareLink({ name: n.name, own: true, o: n }, true) || ''
+        if (!links[k] && unsupportedClientFields(n, 'share').length) basicLinks[k] = shareLink({ name: n.name, own: true, o: n }, true) || ''
       } catch (e) {
         links[k] = ''; basicLinks[k] = ''
         linkErrors[k] = ownShareECH(n).conflict ? 'ECH 分享参数存在冲突，请核对节点 JSON 中的 echConfigList 与导入扩展字段。' : '节点分享链接编码失败，请检查节点配置中的特殊字符。'
@@ -3561,7 +3599,7 @@ function requoteFlow(t) {
 }
 
 function genClash(blacklist, up, policies, lib, own, st, chains, pool) {
-  own = Object.fromEntries(Object.entries(own || {}).filter(([, n]) => !clientOptionsUnsupported(n, 'clash')))
+  own = Object.fromEntries(Object.entries(own || {}).filter(([, n]) => !clientOptionsUnsupported(n, 'clash') && !(n.type === 'tuic' && (n.disableSni && !n.insecure || n.udp === false))))
   const SET = { ...DEFAULT_SETTINGS, ...(st || {}) }
   const D = { ...DEFAULT_DNS, ...(SET.dns || {}) }
   const Y = JSON.stringify
@@ -3941,6 +3979,28 @@ function sbPlugin(name, o) {
   return null
 }
 
+// TUIC converters must not silently drop endpoint, TLS or relay overrides.
+function tuicKvSupported(kv, sharing = false) {
+  const allowed = ['name', '_name', 'type', 'server', 'port', 'uuid', 'password', 'sni', 'servername', 'tls', 'udp', 'token', 'alpn', 'skip-cert-verify', 'name-cert-verify', 'fingerprint', 'client-fingerprint', 'congestion-controller', 'udp-relay-mode', 'heartbeat-interval', 'reduce-rtt', 'disable-sni', 'udp-over-stream']
+  if (Object.keys(kv).some(key => !allowed.includes(key))) return false
+  const v = key => kv[key] === undefined ? '' : unquote(kv[key])
+  if (!/^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/.test(v('uuid')) || kv.password === undefined) return false
+  if (kv.alpn !== undefined) {
+    const protocols = splitTop(v('alpn').replace(/^\[|\]$/g, '')).map(x => unquote(x.trim()))
+    if (!protocols.length || protocols.some(x => !x || /[\s,\x00-\x1f\x7f]/.test(x))) return false
+  }
+  if (v('token') || v('udp-over-stream') === 'true' || v('client-fingerprint') && v('client-fingerprint') !== 'none') return false
+  if (v('congestion-controller') && !['cubic', 'new_reno', 'bbr'].includes(v('congestion-controller'))) return false
+  if (v('udp-relay-mode') && !['native', 'quic'].includes(v('udp-relay-mode'))) return false
+  if (kv['heartbeat-interval'] !== undefined) {
+    const ms = Number(v('heartbeat-interval'))
+    if (!Number.isInteger(ms) || ms < 1 || ms > 86400000) return false
+  }
+  for (const key of ['reduce-rtt', 'disable-sni', 'udp-over-stream']) if (kv[key] !== undefined && !['true', 'false'].includes(v(key))) return false
+  if (sharing && (v('udp-relay-mode') === 'quic' || v('reduce-rtt') === 'true' || v('disable-sni') === 'true' || kv['heartbeat-interval'] !== undefined && Number(v('heartbeat-interval')) !== 10000)) return false
+  return true
+}
+
 // Clash 节点 → sing-box outbound。认不出的协议返回 null，
 // 调用方必须连带把这个节点从所有分组里剔掉（见 genSB 开头）。
 function toSB(n) {
@@ -3972,6 +4032,22 @@ function toSB(n) {
     const o = { type: 'anytls', ...base, password: v('password'), tls }
     for (const [a, b] of [['idle-session-check-interval', 'idle_session_check_interval'], ['idle-session-timeout', 'idle_session_timeout']]) if (v(a)) o[b] = Number(v(a)) + 's'
     if (v('min-idle-session') !== undefined) o.min_idle_session = Number(v('min-idle-session'))
+    return o
+  }
+  if (t === 'tuic') {
+    if (!tuicKvSupported(n.kv)) return null
+    const o = { type: 'tuic', ...base, uuid: v('uuid'), password: v('password'), tls }
+    delete tls.utls
+    if (n.kv.alpn !== undefined && !tls.alpn?.length) return null
+    if (!tls.alpn) tls.alpn = ['h3']
+    for (const [a, b] of [['congestion-controller', 'congestion_control'], ['udp-relay-mode', 'udp_relay_mode']]) if (v(a)) o[b] = v(a)
+    if (v('heartbeat-interval') !== undefined) o.heartbeat = Number(v('heartbeat-interval')) + 'ms'
+    if (v('reduce-rtt') !== undefined) o.zero_rtt_handshake = v('reduce-rtt') === 'true'
+    if (v('disable-sni') !== undefined) {
+      tls.disable_sni = v('disable-sni') === 'true'
+      // Mihomo disables certificate verification as well when SNI is disabled.
+      if (tls.disable_sni) tls.insecure = true
+    }
     return o
   }
   if (t === 'hysteria2') {
@@ -4041,6 +4117,7 @@ function ownToSB(n) {
   if (!n || !OWN_TYPES.includes(n.type)) return null
   if (clientOptionsUnsupported(n, 'singbox')) return null
   const outbound = toSB({ name: n.name, kv: ownToKv(n) })
+  if (outbound && n.type === 'tuic') outbound.tls.insecure = n.insecure === true
   if (outbound && outbound.tls && n.clientOptions && n.clientOptions.singbox) Object.assign(outbound.tls, n.clientOptions.singbox.tls)
   const ech = echForFormat(n, 'singbox')
   if (outbound && outbound.tls && ech.supported && ech.singbox) Object.assign(outbound.tls, ech.singbox)
@@ -4483,7 +4560,7 @@ function shareLink(n, allowOmittedClientOptions = false) {
     const sharedECH = ownShareECH(n.o)
     if (sharedECH.conflict) throw new Error('ECH 分享参数存在冲突，请核对节点配置。')
     if (allowOmittedClientOptions !== true && clientOptionsUnsupported(n.o, 'share')) return ''
-    const link = shareLink({ name: n.name, kv: ownToKv(n.o) })
+    const link = shareLink({ name: n.name, kv: ownToKv(n.o) }, allowOmittedClientOptions === true || n.o.compatibilityMode === 'basic')
     const extras = n.o.importExtras || {}
     if (!link || (!n.o.importExtras && !sharedECH.present)) return link
     if (n.o.type === 'vmess') {
@@ -4558,6 +4635,16 @@ function shareLink(n, allowOmittedClientOptions = false) {
   }
 
   if (t === 'anytls')    return `anytls://${encodeURIComponent(pwd)}@${hostPart(host)}:${port}?${qs}#${tag}`
+  if (t === 'tuic') {
+    if (!tuicKvSupported(n.kv, allowOmittedClientOptions !== true)) return null
+    if (!qs.has('alpn')) {
+      if (n.kv.alpn !== undefined) return null
+      qs.set('alpn', 'h3')
+    }
+    if (v('skip-cert-verify') === 'true') qs.set('allow_insecure', '1')
+    if (v('congestion-controller')) qs.set('congestion_control', v('congestion-controller'))
+    return `tuic://${encodeURIComponent(v('uuid'))}:${encodeURIComponent(pwd)}@${hostPart(host)}:${port}?${qs}#${tag}`
+  }
   if (t === 'trojan')    { addTransport(); return `trojan://${encodeURIComponent(pwd)}@${hostPart(host)}:${port}?${qs}#${tag}` }
   if (t === 'ss') {
     // SIP002：userinfo 用 URL 安全的 base64、不带 padding。标准 base64 里的 / 会截断主机部分
@@ -4700,9 +4787,9 @@ function installLocalFetchClient() {
 
 // Installed into the existing page scope; keeping this as JS avoids nested-template escaping bugs.
 function installOwnEditor() {
-  const types = [{ v: 'vless', label: 'VLESS' }, { v: 'hysteria2', label: 'Hysteria2' }, { v: 'ss', label: 'Shadowsocks' }, { v: 'vmess', label: 'VMess' }, { v: 'anytls', label: 'AnyTLS' }]
+  const types = [{ v: 'vless', label: 'VLESS' }, { v: 'hysteria2', label: 'Hysteria2' }, { v: 'ss', label: 'Shadowsocks' }, { v: 'vmess', label: 'VMess' }, { v: 'anytls', label: 'AnyTLS' }, { v: 'tuic', label: 'TUIC v5' }]
   const networks = [{ v: 'tcp', label: 'TCP / RAW' }, {v:'ws',label:'WebSocket + TLS（可套 CDN）'}, { v: 'httpupgrade', label: 'HTTPUpgrade' }, { v: 'grpc', label: 'gRPC' }, { v: 'h2', label: 'HTTP/2' }, { v: 'http', label: 'TCP + HTTP 伪装' }, { v: 'xhttp', label: 'XHTTP' }]
-  const defaults = type => ({ name: '', type, s: '', p: 443, u: '', sni: '', security: type === 'ss' ? 'none' : type === 'vless' ? 'reality' : 'tls', net: 'tcp', packetEncoding: type === 'vless' ? 'xudp' : '', flow: type === 'vless' ? 'xtls-rprx-vision' : '', cipher: type === 'ss' ? 'aes-128-gcm' : 'auto', fp: 'chrome', alpn: [], insecure: false, udp: true, path: '/', host: '', pk: '', sid: '', plugin: '', pluginOpts: {}, obfs: '', opwd: '', ports: '' })
+  const defaults = type => ({ name: '', type, s: '', p: 443, u: '', sni: '', security: type === 'ss' ? 'none' : type === 'vless' ? 'reality' : 'tls', net: 'tcp', packetEncoding: type === 'vless' ? 'xudp' : '', flow: type === 'vless' ? 'xtls-rprx-vision' : '', cipher: type === 'ss' ? 'aes-128-gcm' : 'auto', fp: 'chrome', alpn: type === 'tuic' ? ['h3'] : [], insecure: false, udp: true, path: '/', host: '', pk: '', sid: '', plugin: '', pluginOpts: {}, obfs: '', opwd: '', ports: '' })
   window.editOwn = async (key) => {
     const isNew = key === null, ow = (OWN && OWN.own) || {}
     const original = isNew ? defaults('vless') : JSON.parse(JSON.stringify(ow[key]))
@@ -4720,11 +4807,12 @@ function installOwnEditor() {
     const toggle = (id, label, checked) => `<label class="own-check"><input id="${id}" type="checkbox" ${checked ? 'checked' : ''}><span class="own-check-box" aria-hidden="true"></span><span>${label}</span></label>`
     const numeric = 'type="number" min="0" step="1"'
     const html = `
-      ${isNew ? `<div class="fg"><label class="lb" for="oimp">从分享链接导入<span class="opt">可选</span></label><div class="row"><input id="oimp" class="mono" placeholder="vless://、hy2://、ss://、vmess://、anytls://" autocomplete="off"><button type="button" class="g" id="oimpb">解析填充</button></div></div><hr class="fsep">` : ''}
+      ${isNew ? `<div class="fg"><label class="lb" for="oimp">从分享链接导入<span class="opt">可选</span></label><div class="row"><input id="oimp" class="mono" placeholder="vless://、hy2://、ss://、vmess://、anytls://、tuic://" autocomplete="off"><button type="button" class="g" id="oimpb">解析填充</button></div></div><hr class="fsep">` : ''}
       ${input('on', '节点名称', n.name, 'maxlength="32"')}
       ${select('ot', '协议', types, n.type)}
       <div class="own-fields own-address">${input('os', '服务器地址（支持 IPv6）', n.s)}${input('op', '端口', n.p, 'type="number" min="1" max="65535" step="1"')}</div>
       ${input('ou', 'UUID / 认证密码', n.u)}
+      <div id="ftuicpassword">${input('otuicpassword', 'TUIC v5 密码（与 UUID 分开，可为空）', n.password)}</div>
       <div id="fcipher">${select('ocipher', '加密方式', [{v:'auto',label:'auto'},{v:'none',label:'none'},{v:'zero',label:'zero'}, ...['aes-128-gcm','aes-192-gcm','aes-256-gcm','chacha20-poly1305','chacha20-ietf-poly1305','xchacha20-ietf-poly1305','2022-blake3-aes-128-gcm','2022-blake3-aes-256-gcm','2022-blake3-chacha20-poly1305','aes-128-ctr','aes-192-ctr','aes-256-ctr','aes-128-cfb','aes-192-cfb','aes-256-cfb','aes-128-ccm','aes-192-ccm','aes-256-ccm','aes-128-gcm-siv','aes-256-gcm-siv','chacha20-ietf','chacha20','xchacha20','chacha8-ietf-poly1305','xchacha8-ietf-poly1305','lea-128-gcm','lea-192-gcm','lea-256-gcm','rabbit128-poly1305','aegis-128l','aegis-256','aez-384','deoxys-ii-256-128','rc4-md5'].map(v => ({v,label:v}))], n.cipher)}</div>
       <div id="fsecurity">${select('osecurity', '连接安全', [{v:'reality',label:'Reality'},{v:'tls',label:'TLS'},{v:'none',label:'不加密（仅可信内网 / VLESS Encryption）'}], n.security)}</div>
       <div id="ftls">${input('osni', 'SNI / TLS 服务器名称', n.sni)}</div>
@@ -4745,9 +4833,10 @@ function installOwnEditor() {
         <div id="fh"><div class="own-fields">${input('oports', 'HY2 端口跳跃（如 443,20000-20100）', n.ports)}${input('ohop', '跳跃间隔（秒，可留空）', n.hopInterval, numeric)}</div><div class="own-fields">${input('oup', '上行带宽（Mbps）', n.upMbps, 'type="number" min="0.001" step="any"')}${input('odown', '下行带宽（Mbps）', n.downMbps, 'type="number" min="0.001" step="any"')}</div>${select('oobfs', '混淆类型', [{v:'',label:'不启用混淆'},{v:'salamander',label:'Salamander'}], n.obfs || '')}${input('oopwd', '混淆密码', n.opwd)}</div>
         <div id="fss">${toggle('ouot', '启用 UDP-over-TCP', n.uot)}${select('ouotversion', 'UDP-over-TCP 版本', [{v:'2',label:'2'},{v:'1',label:'1'}], String(n.uotVersion || 2))}${select('oplugin', 'SS 插件', [{v:'',label:'不使用插件'},{v:'obfs',label:'simple-obfs'},{v:'v2ray-plugin',label:'v2ray-plugin'}], n.plugin || '')}<div id="fplugin">${select('opluginmode', '插件模式', [{v:'websocket',label:'WebSocket（v2ray-plugin）'},{v:'http',label:'HTTP（obfs）'},{v:'tls',label:'TLS（obfs）'}], n.pluginOpts?.mode || (n.plugin === 'obfs' ? 'http' : 'websocket'))}${input('opluginhost', '插件 Host', n.pluginOpts?.host)}${input('opluginpath', '插件路径', n.pluginOpts?.path || '/')}${toggle('oplugintls', '插件 TLS', String(n.pluginOpts?.tls) === 'true')}${toggle('opluginmux', '插件 Mux', String(n.pluginOpts?.mux) === 'true')}</div></div>
         <div id="fanytls"><div class="own-fields">${input('oidlecheck', '空闲会话检查间隔（秒）', n.idleCheck, numeric)}${input('oidletimeout', '空闲会话超时（秒）', n.idleTimeout, numeric)}</div>${input('ominidle', '最少保留的空闲会话数量', n.minIdle, numeric)}</div>
+        <div id="ftuic"><div class="own-fields">${select('otuiccongestion', '拥塞控制', [{v:'',label:'客户端默认'}, ...['cubic','new_reno','bbr'].map(v => ({v,label:v}))], n.congestionControl || '')}${select('otuicrelay', 'UDP 中继模式', [{v:'',label:'客户端默认'}, {v:'native',label:'native（原生 UDP）'}, {v:'quic',label:'quic（QUIC 流）'}], n.udpRelayMode || '')}</div>${input('otuicheartbeat', '心跳间隔（毫秒，可留空）', n.heartbeatInterval, 'type="number" min="1" max="86400000" step="1"')}<div class="own-fields">${select('otuicrtt', '0-RTT 握手', [{v:'',label:'客户端默认'}, {v:'0',label:'关闭'}, {v:'1',label:'开启（有重放风险）'}], n.zeroRtt === undefined ? '' : n.zeroRtt ? '1' : '0')}${select('otuicsni', '发送 SNI', [{v:'',label:'客户端默认'}, {v:'0',label:'正常发送'}, {v:'1',label:'禁用 SNI'}], n.disableSni === undefined ? '' : n.disableSni ? '1' : '0')}</div><div class="hint">TUIC v5 使用 UUID + 密码，不支持 v4 token。0-RTT 可能增加重放风险，默认不主动开启。Mihomo 禁用 SNI 时会同时跳过证书校验：若当前仍要求校验证书，Clash 格式不会下发该节点，不能自动降低安全要求。通用链接未必能携带这些高级参数。</div></div>
         <div class="fg" id="fimportextras" ${n.importExtras ? '' : 'hidden'}><label class="lb" for="oimportextras">导入扩展字段（JSON，原样保留）</label><textarea id="oimportextras" spellcheck="false">${esc(JSON.stringify(n.importExtras || {}))}</textarea><div class="hint">这些字段不会导致整条链接被拒绝。当前完整配置未必支持，请核对兼容提示；分享链接会尽量原样保留。字段可能包含敏感信息，请勿截图外发。</div></div>
         <div class="fg" id="fclientoptions" ${n.clientOptions ? '' : 'hidden'}><label class="lb" for="oclientoptions">客户端专用参数（JSON，原样保留）</label><textarea id="oclientoptions" spellcheck="false">${esc(JSON.stringify(n.clientOptions || {}))}</textarea><div class="hint">保留 ECH、分片等原参数。无法等效转换的格式默认不下发；可在下方明确确认基础兼容输出，下发可表达的基础配置。</div></div>
-        <div class="fg" id="fcompatmode" ${n.clientOptions ? '' : 'hidden'}>${toggle('obasic', '基础兼容输出（需确认）', n.compatibilityMode === 'basic')}<div class="hint">仅在无法完整转换的格式中省略专用参数，下发基础节点；原参数保留。默认关闭，可随时恢复。此选择影响包含该节点的所有订阅。</div></div>
+        <div class="fg" id="fcompatmode" ${n.clientOptions || n.type === 'tuic' ? '' : 'hidden'}>${toggle('obasic', '基础兼容输出（需确认）', n.compatibilityMode === 'basic')}<div class="hint">仅在无法完整转换的格式中省略专用参数，下发基础节点；原参数保留。默认关闭，可随时恢复。此选择影响包含该节点的所有订阅。</div></div>
       </details>
       ${isNew ? '' : `<div class="fg"><label class="lb">节点标识（自动生成，不可改）</label><input class="mono" value="${esc(key)}" disabled></div>`}`
     let readForm
@@ -4770,7 +4859,7 @@ function installOwnEditor() {
         b.__basicAcknowledged = false
         if (!get('obasic').checked) return
         get('obasic').checked = false
-        const confirmed = await confirmBasicCompatibility(b, [{ compatibilityMode:'basic' }])
+        const confirmed = await confirmBasicCompatibility(b, [{ compatibilityMode:'basic', type:pick('ot') }])
         if (confirmed && b.isConnected) { get('obasic').checked = true; b.__basicAcknowledged = true }
       })
       const choose = (id, value) => {
@@ -4780,7 +4869,7 @@ function installOwnEditor() {
       let active = n.type, filling = false, compatibilityExplicit = n.compatibilityMode !== undefined
       const drafts = { [active]: n }
       readForm = (type = pick('ot')) => {
-        const d = { name: val('on'), type, s: val('os'), p: val('op'), u: get('ou').value, sni: type === 'ss' ? '' : val('osni'), security: type === 'ss' ? 'none' : ['anytls','hysteria2'].includes(type) ? 'tls' : pick('osecurity'), udp: get('oudp').checked }
+        const d = { name: val('on'), type, s: val('os'), p: val('op'), u: get('ou').value, sni: type === 'ss' ? '' : val('osni'), security: type === 'ss' ? 'none' : ['anytls','hysteria2','tuic'].includes(type) ? 'tls' : pick('osecurity'), udp: get('oudp').checked }
         if (compatibilityExplicit || get('obasic').checked) d.compatibilityMode = get('obasic').checked ? 'basic' : 'strict'
         const readJSON = id => { try { return JSON.parse(get(id).value || '{}') } catch (e) { e.field = id; throw e } }
         const extra = readJSON('oimportextras')
@@ -4795,7 +4884,7 @@ function installOwnEditor() {
             if (val('oearly') !== '') { d.earlyData = Number(val('oearly')); d.earlyDataHeader = val('oearlyheader') }
           }
         }
-        if (type !== 'ss') Object.assign(d, { fp: type === 'hysteria2' ? 'none' : pick('ofp'), alpn: val('oalpn').split(',').map(x => x.trim()).filter(Boolean), insecure: get('oinsecure').checked, verifyName:val('overifyname'), certSha256:val('ocertsha256') })
+        if (type !== 'ss') Object.assign(d, { fp: ['hysteria2','tuic'].includes(type) ? 'none' : pick('ofp'), alpn: val('oalpn').split(',').map(x => x.trim()).filter(Boolean), insecure: get('oinsecure').checked, verifyName:val('overifyname'), certSha256:val('ocertsha256') })
         if (type === 'vless') {
           Object.assign(d, { pk: val('opk'), sid: val('osid'), flow: pick('oflow'), encryption: val('oencryption') || 'none' })
           if (d.security === 'reality' && pick('orealitypq') !== '') d.realityPQ = pick('orealitypq') === '1'
@@ -4813,6 +4902,15 @@ function installOwnEditor() {
           for (const [k, id] of [['hopInterval','ohop'],['upMbps','oup'],['downMbps','odown']]) if (val(id) !== '') d[k] = Number(val(id))
         }
         if (type === 'anytls') for (const [k, id] of [['idleCheck','oidlecheck'],['idleTimeout','oidletimeout'],['minIdle','ominidle']]) if (val(id) !== '') d[k] = Number(val(id))
+        if (type === 'tuic') {
+          d.password = get('otuicpassword').value
+          if (!d.alpn.length) d.alpn = ['h3']
+          if (pick('otuiccongestion')) d.congestionControl = pick('otuiccongestion')
+          if (pick('otuicrelay')) d.udpRelayMode = pick('otuicrelay')
+          if (val('otuicheartbeat') !== '') d.heartbeatInterval = Number(val('otuicheartbeat'))
+          if (pick('otuicrtt') !== '') d.zeroRtt = pick('otuicrtt') === '1'
+          if (pick('otuicsni') !== '') d.disableSni = pick('otuicsni') === '1'
+        }
         return d
       }
       const fill = data => {
@@ -4823,12 +4921,16 @@ function installOwnEditor() {
         for (const [id, k] of [['on','name'],['os','s'],['op','p'],['ou','u'],['osni','sni'],['opk','pk'],['osid','sid'],['opath','path'],['ohost','host'],['ogrpc','serviceName'],['oencryption','encryption'],['oearly','earlyData'],['oearlyheader','earlyDataHeader'],['oalter','alterId'],['oports','ports'],['ohop','hopInterval'],['oup','upMbps'],['odown','downMbps'],['oopwd','opwd'],['oidlecheck','idleCheck'],['oidletimeout','idleTimeout'],['ominidle','minIdle']]) get(id).value = data[k] ?? (k === 'encryption' ? 'none' : k === 'p' ? 443 : k === 'path' ? '/' : k === 'alterId' ? 0 : '')
         get('oalpn').value = (data.alpn || []).join(','); get('oheaders').value = JSON.stringify(data.headers || {})
         get('overifyname').value = data.verifyName || ''; get('ocertsha256').value = data.certSha256 || ''
+        get('otuicpassword').value = data.password ?? ''; get('otuicheartbeat').value = data.heartbeatInterval ?? ''
+        choose('otuiccongestion', data.congestionControl || ''); choose('otuicrelay', data.udpRelayMode || '')
+        choose('otuicrtt', data.zeroRtt === undefined ? '' : data.zeroRtt ? '1' : '0')
+        choose('otuicsni', data.disableSni === undefined ? '' : data.disableSni ? '1' : '0')
         get('oimportextras').value = JSON.stringify(data.importExtras || {})
         get('fimportextras').hidden = !data.importExtras
         get('oclientoptions').value = JSON.stringify(data.clientOptions || {})
         get('fclientoptions').hidden = !data.clientOptions
         get('obasic').checked = data.compatibilityMode === 'basic'
-        get('fcompatmode').hidden = !data.clientOptions
+        get('fcompatmode').hidden = !data.clientOptions && data.type !== 'tuic'
         for (const [id, k] of [['ot','type'],['osecurity','security'],['onet','net'],['oflow','flow'],['ofp','fp'],['ocipher','cipher'],['omode','mode'],['opacket','packetEncoding'],['oobfs','obfs'],['oplugin','plugin']]) choose(id, data[k] ?? (k === 'security' ? 'tls' : k === 'net' ? 'tcp' : k === 'mode' ? 'auto' : k === 'fp' ? 'none' : k === 'cipher' ? 'auto' : ''))
         choose('ouotversion', data.uotVersion || 2)
         choose('orealitypq', data.realityPQ === undefined ? '' : data.realityPQ ? '1' : '0')
@@ -4858,11 +4960,13 @@ function installOwnEditor() {
           const next = drafts[t] || { ...defaults(t), name: val('on'), s: val('os'), p: val('op'), sni: val('osni') }
           active = t; fill(next)
         }
-        const transport = ['vless','vmess'].includes(t), sec = ['anytls','hysteria2'].includes(t) ? 'tls' : pick('osecurity'), net = pick('onet')
+        const transport = ['vless','vmess'].includes(t), sec = ['anytls','hysteria2','tuic'].includes(t) ? 'tls' : pick('osecurity'), net = pick('onet')
         const hide = (id, value) => { get(id).hidden = value }
         hide('fcipher', !['ss','vmess'].includes(t)); hide('fsecurity', !transport)
         hide('ftls', t === 'ss' || sec === 'none'); hide('fvtls', t === 'ss' || sec === 'none')
-        hide('ffp', t === 'hysteria2')
+        hide('ffp', ['hysteria2','tuic'].includes(t))
+        hide('ftuic', t !== 'tuic'); hide('ftuicpassword', t !== 'tuic')
+        get('oalpn').placeholder = t === 'tuic' ? '留空使用 h3' : ''
         hide('ftransport', !transport); hide('fr', t !== 'vless' || sec !== 'reality')
         hide('fw', !transport || !['ws','httpupgrade','h2','http','xhttp'].includes(net)); hide('fgrpc', !transport || net !== 'grpc'); hide('fxmode', !transport || net !== 'xhttp')
         hide('fvless', t !== 'vless'); hide('fvmess', t !== 'vmess'); hide('fpacket', !transport)
@@ -4870,7 +4974,7 @@ function installOwnEditor() {
         const cipherOptions = get('ocipher')._pop.querySelectorAll('.selo')
         cipherOptions.forEach(opt => { opt.hidden = t === 'vmess' ? !['auto','none','zero','aes-128-gcm','chacha20-poly1305','aes-128-ctr','aes-128-cfb'].includes(opt.dataset.v) : ['auto','zero','chacha20-poly1305'].includes(opt.dataset.v) })
         get('osecurity')._pop.querySelectorAll('.selo').forEach(opt => { opt.hidden = t === 'vmess' && opt.dataset.v === 'reality' })
-        get('ou').previousElementSibling.textContent = transport ? 'UUID' : t === 'hysteria2' ? '认证密码（支持 username:password）' : '密码 / 密钥'
+        get('ou').previousElementSibling.textContent = transport || t === 'tuic' ? 'UUID' : t === 'hysteria2' ? '认证密码（支持 username:password）' : '密码 / 密钥'
         if (t === 'vmess' && !['auto','none','zero','aes-128-gcm','chacha20-poly1305','aes-128-ctr','aes-128-cfb'].includes(pick('ocipher'))) choose('ocipher','auto')
         if (t === 'ss' && ['auto','zero','chacha20-poly1305'].includes(pick('ocipher'))) choose('ocipher','aes-128-gcm')
         if (t === 'ss' && pick('oplugin') === 'obfs' && pick('opluginmode') === 'websocket') choose('opluginmode','http')
@@ -4940,7 +5044,7 @@ function installOwnEditor() {
       }
       const r = await api('/api/own', { own: { ...base, [k]: np } })
       if (!r.ok) {
-        const fields = { name:'on',type:'ot',s:'os',p:'op',u:'ou',security:'osecurity',pk:'opk',sid:'osid',realityPQ:'orealitypq',flow:'oflow',cipher:'ocipher',alpn:'oalpn',fp:'ofp',headers:'oheaders',plugin:'oplugin',pluginOpts:'oplugin',obfs:'oobfs',opwd:'oopwd',ports:'oports',encryption:'oencryption',net:'onet',path:'opath',hopInterval:'ohop',upMbps:'oup',downMbps:'odown',idleCheck:'oidlecheck',idleTimeout:'oidletimeout',minIdle:'ominidle',importExtras:'oimportextras',clientOptions:'oclientoptions',compatibilityMode:'obasic',verifyName:'overifyname',certSha256:'ocertsha256' }
+        const fields = { name:'on',type:'ot',s:'os',p:'op',u:'ou',security:'osecurity',pk:'opk',sid:'osid',realityPQ:'orealitypq',flow:'oflow',cipher:'ocipher',alpn:'oalpn',fp:'ofp',headers:'oheaders',plugin:'oplugin',pluginOpts:'oplugin',obfs:'oobfs',opwd:'oopwd',ports:'oports',encryption:'oencryption',net:'onet',path:'opath',hopInterval:'ohop',upMbps:'oup',downMbps:'odown',idleCheck:'oidlecheck',idleTimeout:'oidletimeout',minIdle:'ominidle',password:'otuicpassword',congestionControl:'otuiccongestion',udpRelayMode:'otuicrelay',heartbeatInterval:'otuicheartbeat',zeroRtt:'otuicrtt',disableSni:'otuicsni',importExtras:'oimportextras',clientOptions:'oclientoptions',compatibilityMode:'obasic',verifyName:'overifyname',certSha256:'ocertsha256' }
         b.querySelector('#ownadvanced').open = true
         return { msg: r.msg || '保存失败', field: fields[r.field] || 'on' }
       }
@@ -4993,6 +5097,13 @@ function parseOwnJSON(text) {
     const seconds = Number(match[1]) * ({ ms: 0.001, s: 1, m: 60, h: 3600 })[match[2]]
     if (!Number.isInteger(seconds) || seconds <= 0 || seconds > 86400) fail(path, '本站时长字段仅支持 1-86400 整秒')
     return seconds
+  }
+  const milliseconds = (v, path) => {
+    const match = string(v, path, false).match(/^(\d+(?:\.\d+)?)(ms|s|m|h)$/)
+    if (!match) fail(path, 'TUIC 心跳时长必须使用 ms/s/m/h 单位')
+    const ms = Number(match[1]) * ({ ms: 1, s: 1000, m: 60000, h: 3600000 })[match[2]]
+    if (!Number.isInteger(ms) || ms < 1 || ms > 86400000) fail(path, 'TUIC 心跳间隔仅支持 1-86400000 整数毫秒')
+    return ms
   }
   const stringList = (v, path) => {
     if (!Array.isArray(v)) fail(path, '必须是字符串数组')
@@ -5075,19 +5186,21 @@ function parseOwnJSON(text) {
       ss: ['cipher', 'uot', 'uotVersion', 'plugin', 'pluginOpts'],
       hysteria2: ['obfs', 'opwd', 'ports', 'hopInterval', 'upMbps', 'downMbps'],
       anytls: ['idleCheck', 'idleTimeout', 'minIdle'],
+      tuic: ['password', 'congestionControl', 'udpRelayMode', 'heartbeatInterval', 'zeroRtt', 'disableSni'],
     }
     if (!has(specific, type)) fail(path + '.type', '不支持的节点协议')
     keys(o, [...common, ...(type === 'ss' ? [] : tls), ...specific[type]], path)
     o.name = has(o, 'name') ? name(o.name, path + '.name') : type.toUpperCase() + ' ' + index
     for (const key of ['s', 'u']) string(o[key], path + '.' + key, false)
+    if (type === 'tuic') string(o.password, path + '.password')
     if (!['string', 'number'].includes(typeof o.p)) fail(path + '.p', '端口必须是整数或整数字符串')
-    for (const key of ['sni', 'security', 'net', 'path', 'host', 'serviceName', 'mode', 'earlyDataHeader', 'packetEncoding', 'flow', 'encryption', 'pk', 'sid', 'fp', 'verifyName', 'certSha256', 'cipher', 'plugin', 'obfs', 'opwd', 'ports']) if (has(o, key)) string(o[key], path + '.' + key)
-    for (const key of ['udp', 'insecure', 'uot']) if (has(o, key)) boolean(o[key], path + '.' + key)
-    for (const key of ['alterId', 'uotVersion', 'earlyData', 'hopInterval', 'upMbps', 'downMbps', 'idleCheck', 'idleTimeout', 'minIdle']) if (has(o, key)) number(o[key], path + '.' + key)
+    for (const key of ['sni', 'security', 'net', 'path', 'host', 'serviceName', 'mode', 'earlyDataHeader', 'packetEncoding', 'flow', 'encryption', 'pk', 'sid', 'fp', 'verifyName', 'certSha256', 'cipher', 'plugin', 'obfs', 'opwd', 'ports', 'congestionControl', 'udpRelayMode']) if (has(o, key)) string(o[key], path + '.' + key)
+    for (const key of ['udp', 'insecure', 'uot', 'zeroRtt', 'disableSni']) if (has(o, key)) boolean(o[key], path + '.' + key)
+    for (const key of ['alterId', 'uotVersion', 'earlyData', 'hopInterval', 'upMbps', 'downMbps', 'idleCheck', 'idleTimeout', 'minIdle', 'heartbeatInterval']) if (has(o, key)) number(o[key], path + '.' + key)
     if (has(o, 'alpn')) stringList(o.alpn, path + '.alpn')
     const sec = o.security === undefined ? type === 'vless' ? o.net === 'ws' ? 'tls' : 'reality' : ['ss', 'vmess'].includes(type) ? 'none' : 'tls' : o.security
     // A new import must not inherit the old HY2 record's insecure TLS default.
-    if (['hysteria2', 'anytls'].includes(type) && o.security === undefined) o.security = 'tls'
+    if (['hysteria2', 'anytls', 'tuic'].includes(type) && o.security === undefined) o.security = 'tls'
     if (type !== 'ss' && !has(o, 'insecure')) o.insecure = false
     if (type === 'ss' && sec !== 'none') fail(path + '.security', '本站 SS 没有外层 TLS 字段，请使用插件自身的 TLS 配置')
     if (sec === 'none') {
@@ -5128,8 +5241,10 @@ function parseOwnJSON(text) {
       ss: ['password', 'cipher', 'udp-over-tcp', 'udp-over-tcp-version', 'plugin', 'plugin-opts'],
       hysteria2: ['password', 'ports', 'hop-interval', 'up', 'down', 'obfs', 'obfs-password'],
       anytls: ['password', 'idle-session-check-interval', 'idle-session-timeout', 'min-idle-session'],
+      tuic: ['uuid', 'password', 'congestion-controller', 'udp-relay-mode', 'heartbeat-interval', 'reduce-rtt', 'disable-sni'],
     }
     if (!has(allowed, type)) fail(path + '.type', '本站不支持该 Clash/Mihomo 代理协议')
+    if (type === 'tuic' && has(input, 'token')) fail(path + '.token', '仅支持 TUIC v5 UUID + 密码，不支持 v4 token')
     if (type === 'vless') for (const [key, value] of [['alterId', 0], ['cipher', 'auto']]) if (has(input, key)) {
       noOp(input, key, value, path)
       delete input[key]
@@ -5141,10 +5256,10 @@ function parseOwnJSON(text) {
     }
     const tlsKeys = ['tls', 'sni', 'servername', 'skip-cert-verify', 'client-fingerprint', 'alpn', 'fingerprint', 'name-cert-verify', 'reality-opts']
     keys(input, ['name', 'type', 'server', 'port', 'udp', ...allowed[type], ...(type === 'ss' ? [] : tlsKeys), ...(transport ? ['network', 'ws-opts', 'grpc-opts', 'h2-opts', 'http-opts', 'xhttp-opts'] : [])], path)
-    const o = { name: has(input, 'name') ? input.name : type.toUpperCase() + ' ' + index, type, s: input.server, p: port(input.port, path + '.port'), u: transport ? input.uuid : input.password }
-    const source = { name: path + '.name', s: path + '.server', p: path + '.port', u: path + (transport ? '.uuid' : '.password') }
+    const o = { name: has(input, 'name') ? input.name : type.toUpperCase() + ' ' + index, type, s: input.server, p: port(input.port, path + '.port'), u: transport || type === 'tuic' ? input.uuid : input.password }
+    const source = { name: path + '.name', s: path + '.server', p: path + '.port', u: path + (transport || type === 'tuic' ? '.uuid' : '.password') }
     name(o.name, source.name); string(o.s, source.s, false); string(o.u, source.u, false)
-    o.udp = has(input, 'udp') ? boolean(input.udp, path + '.udp') : type === 'hysteria2'
+    o.udp = has(input, 'udp') ? boolean(input.udp, path + '.udp') : ['hysteria2', 'tuic'].includes(type)
     if (type === 'ss') {
       o.security = 'none'
       o.cipher = string(input.cipher, path + '.cipher', false)
@@ -5157,8 +5272,8 @@ function parseOwnJSON(text) {
       plugin(o, path, 'plugin-opts')
       return { o, source }
     }
-    const tls = has(input, 'tls') ? boolean(input.tls, path + '.tls') : ['hysteria2', 'anytls'].includes(type)
-    if (['hysteria2', 'anytls'].includes(type) && !tls) fail(path + '.tls', '该协议必须启用 TLS')
+    const tls = has(input, 'tls') ? boolean(input.tls, path + '.tls') : ['hysteria2', 'anytls', 'tuic'].includes(type)
+    if (['hysteria2', 'anytls', 'tuic'].includes(type) && !tls) fail(path + '.tls', '该协议必须启用 TLS')
     const reality = has(input, 'reality-opts') ? object(input['reality-opts'], path + '.reality-opts') : null
     if (reality && !tls) fail(path + '.tls', 'Reality 不能与 tls:false 同时使用')
     o.security = reality ? 'reality' : tls ? 'tls' : 'none'
@@ -5220,6 +5335,16 @@ function parseOwnJSON(text) {
       } else {
         o.cipher = has(input, 'cipher') ? input.cipher : 'auto'
         o.alterId = has(input, 'alterId') ? input.alterId : 0
+      }
+    } else if (type === 'tuic') {
+      o.password = string(input.password, path + '.password'); source.password = path + '.password'
+      if (!has(input, 'alpn')) note(path + '.alpn', '按 Mihomo 的缺省值 h3 保存，避免转换后缺少 QUIC ALPN')
+      for (const [a, b] of [['congestion-controller', 'congestionControl'], ['udp-relay-mode', 'udpRelayMode'], ['heartbeat-interval', 'heartbeatInterval'], ['reduce-rtt', 'zeroRtt'], ['disable-sni', 'disableSni']]) if (has(input, a)) {
+        o[b] = input[a]; source[b] = path + '.' + a
+      }
+      if (o.disableSni === true) {
+        o.insecure = true; source.insecure = path + '.disable-sni'
+        note(path + '.disable-sni', 'Mihomo 实际会同时跳过证书校验，保留这一风险状态，保存前需确认')
       }
     } else if (type === 'hysteria2') {
       copyFields(input, o, [['obfs', 'obfs'], ['obfs-password', 'opwd'], ['hop-interval', 'hopInterval']], path)
@@ -5390,11 +5515,12 @@ function parseOwnJSON(text) {
       ss: ['method', 'password', 'udp_over_tcp'],
       hysteria2: ['password', 'server_ports', 'hop_interval', 'up_mbps', 'down_mbps', 'obfs'],
       anytls: ['password', 'idle_session_check_interval', 'idle_session_timeout', 'min_idle_session'],
+      tuic: ['uuid', 'password', 'congestion_control', 'udp_relay_mode', 'zero_rtt_handshake', 'heartbeat', 'network', 'udp_over_stream'],
     }
     if (!has(allowed, type)) fail(path + '.type', '本站不支持该 sing-box 出站协议')
     keys(input, ['type', 'tag', 'server', 'server_port', ...allowed[type], ...(type === 'ss' ? [] : ['tls']), ...(transport ? ['transport'] : [])], path)
-    const o = { type, name: has(input, 'tag') ? name(input.tag, path + '.tag') : type.toUpperCase() + ' ' + index, s: input.server, u: transport ? input.uuid : input.password }
-    const source = { name: path + '.tag', s: path + '.server', p: path + '.server_port', u: path + (transport ? '.uuid' : '.password') }
+    const o = { type, name: has(input, 'tag') ? name(input.tag, path + '.tag') : type.toUpperCase() + ' ' + index, s: input.server, u: transport || type === 'tuic' ? input.uuid : input.password }
+    const source = { name: path + '.tag', s: path + '.server', p: path + '.server_port', u: path + (transport || type === 'tuic' ? '.uuid' : '.password') }
     string(o.s, source.s, false); string(o.u, source.u, false)
     const put = (from, target, fromPath = path, field = input) => {
       if (has(field, from)) { o[target] = field[from]; source[target] = fromPath + '.' + from }
@@ -5434,13 +5560,14 @@ function parseOwnJSON(text) {
       return { o, source }
     }
     const tls = opts(input, 'tls', path), tp = path + '.tls'
-    keys(tls, ['enabled', 'server_name', 'insecure', 'alpn', 'utls', 'reality', 'fragment', 'record_fragment', 'fragment_fallback_delay'], tp)
-    const enabled = has(tls, 'enabled') ? boolean(tls.enabled, tp + '.enabled') : ['anytls', 'hysteria2'].includes(type)
-    if (['anytls', 'hysteria2'].includes(type) && !enabled) fail(tp + '.enabled', '该协议必须启用 TLS')
+    keys(tls, ['enabled', 'server_name', 'insecure', 'alpn', 'utls', 'reality', 'fragment', 'record_fragment', 'fragment_fallback_delay', ...(type === 'tuic' ? ['disable_sni'] : [])], tp)
+    const enabled = has(tls, 'enabled') ? boolean(tls.enabled, tp + '.enabled') : ['anytls', 'hysteria2', 'tuic'].includes(type)
+    if (['anytls', 'hysteria2', 'tuic'].includes(type) && !enabled) fail(tp + '.enabled', '该协议必须启用 TLS')
     if (!enabled && Object.keys(tls).some(k => k !== 'enabled')) fail(tp, '未启用 TLS 时不能静默忽略 TLS 设置')
     o.security = enabled ? 'tls' : 'none'; o.insecure = false
     source.security = tp + '.enabled'; source.insecure = tp + '.insecure'
     if (enabled) {
+      if (type === 'tuic' && has(tls, 'disable_sni')) { o.disableSni = boolean(tls.disable_sni, tp + '.disable_sni'); source.disableSni = tp + '.disable_sni' }
       if (has(tls, 'server_name')) o.sni = string(tls.server_name, tp + '.server_name')
       source.sni = tp + '.server_name'
       if (has(tls, 'insecure')) o.insecure = boolean(tls.insecure, tp + '.insecure')
@@ -5511,6 +5638,16 @@ function parseOwnJSON(text) {
         noOp(tr, 'method', 'GET', rp)
         for (const [a, b] of [['max_early_data', 'earlyData'], ['early_data_header_name', 'earlyDataHeader'], ['service_name', 'serviceName']]) if (has(tr, a)) { o[b] = tr[a]; source[b] = rp + '.' + a }
       }
+    } else if (type === 'tuic') {
+      o.password = has(input, 'password') ? string(input.password, path + '.password') : ''; source.password = path + '.password'
+      if (!has(tls, 'alpn')) fail(tp + '.alpn', '当前编辑器暂不支持未指定 ALPN 的 TUIC sing-box 配置；请核对服务端并填写实际列表，不会猜测补值')
+      put('congestion_control', 'congestionControl'); put('udp_relay_mode', 'udpRelayMode'); put('zero_rtt_handshake', 'zeroRtt')
+      if (has(input, 'heartbeat')) { o.heartbeatInterval = milliseconds(input.heartbeat, path + '.heartbeat'); source.heartbeatInterval = path + '.heartbeat' }
+      if (has(input, 'network')) {
+        if (input.network !== 'tcp') fail(path + '.network', 'TUIC 目前只支持双网络或 network:tcp；UDP-only 无法等效导出到 Clash')
+        o.udp = false
+      }
+      noOp(input, 'udp_over_stream', false, path)
     } else if (type === 'hysteria2') {
       put('up_mbps', 'upMbps'); put('down_mbps', 'downMbps')
       if (has(input, 'hop_interval')) { o.hopInterval = duration(input.hop_interval, path + '.hop_interval'); source.hopInterval = path + '.hop_interval' }
@@ -5915,19 +6052,19 @@ function parseOwnJSON(text) {
 function installOwnJSONUI() {
   const uuid = '11111111-2222-3333-4444-555555555555'
   const clashNode = type => ({ name:'示例 ' + type.toUpperCase(), type, server:'example.com', port:type === 'ss' ? 8388 : 443,
-    ...(['vless','vmess'].includes(type) ? {uuid, tls:true, servername:'example.com', ...(type === 'vless' ? {encryption:'none', flow:''} : {cipher:'auto', alterId:0})} : {password:'your-password', ...(type === 'ss' ? {cipher:'aes-128-gcm'} : {sni:'example.com'})}) })
+    ...(['vless','vmess'].includes(type) ? {uuid, tls:true, servername:'example.com', ...(type === 'vless' ? {encryption:'none', flow:''} : {cipher:'auto', alterId:0})} : {password:'your-password', ...(type === 'tuic' ? {uuid} : {}), ...(type === 'ss' ? {cipher:'aes-128-gcm'} : {sni:'example.com'})}) })
   const singboxNode = type => ({ type:type === 'ss' ? 'shadowsocks' : type, tag:'示例 ' + type.toUpperCase(), server:'example.com', server_port:type === 'ss' ? 8388 : 443,
-    ...(['vless','vmess'].includes(type) ? {uuid, ...(type === 'vmess' ? {security:'auto', alter_id:0} : {flow:''})} : {password:'your-password', ...(type === 'ss' ? {method:'aes-128-gcm'} : {})}),
-    ...(type === 'ss' ? {} : {tls:{enabled:true, server_name:'example.com', insecure:false}}) })
+    ...(['vless','vmess'].includes(type) ? {uuid, ...(type === 'vmess' ? {security:'auto', alter_id:0} : {flow:''})} : {password:'your-password', ...(type === 'tuic' ? {uuid} : {}), ...(type === 'ss' ? {method:'aes-128-gcm'} : {})}),
+    ...(type === 'ss' ? {} : {tls:{enabled:true, server_name:'example.com', insecure:false, ...(type === 'tuic' ? {alpn:['h3']} : {})}}) })
   const xrayNode = type => ({ tag:'示例 ' + type.toUpperCase(), protocol:type === 'ss' ? 'shadowsocks' : type,
     settings:{address:'example.com', port:type === 'ss' ? 8388 : 443,
       ...(type === 'ss' ? {method:'aes-128-gcm', password:'your-password'} : {id:uuid, ...(type === 'vless' ? {encryption:'none'} : {security:'auto', alterId:0})})},
     ...(type === 'ss' ? {} : {streamSettings:{network:'tcp', security:'tls', tlsSettings:{serverName:'example.com', allowInsecure:false}}}) })
-  const protocols = [['ss','SS'],['vless','VLESS'],['vmess','VMess'],['hysteria2','HY2'],['anytls','AnyTLS']]
+  const protocols = [['ss','SS'],['vless','VLESS'],['vmess','VMess'],['hysteria2','HY2'],['anytls','AnyTLS'],['tuic','TUIC v5']]
   const examples = [
-    ['Clash / Mihomo · SS / VLESS / VMess / HY2 / AnyTLS', protocols.map(([type, label]) => [label, clashNode(type)])],
+    ['Clash / Mihomo · SS / VLESS / VMess / HY2 / AnyTLS / TUIC v5', protocols.map(([type, label]) => [label, clashNode(type)])],
     ['Xray / v2rayN · SS / VLESS / VMess', protocols.slice(0,3).map(([type, label]) => [label, xrayNode(type)])],
-    ['sing-box / v2rayN · SS / VLESS / VMess / HY2 / AnyTLS', protocols.map(([type, label]) => [label, singboxNode(type)])],
+    ['sing-box / v2rayN · SS / VLESS / VMess / HY2 / AnyTLS / TUIC v5', protocols.map(([type, label]) => [label, singboxNode(type)])],
   ]
   window.ownJSONDialog = async ({ initial = '', single = false } = {}) => {
     let parsed = null, parsedText = '', saving = false
@@ -6842,7 +6979,7 @@ async function confirmBasicCompatibility(parent, nodes){
   try {
     return !!await modal({ title:'启用基础兼容输出', ok:'启用基础兼容',
       desc:'原始参数仍保留；此选择影响包含这些节点的所有订阅。',
-      html:\`<div class="alert">\${icon('warn')}<span>无法完整转换时，将省略 ECH、分片、finalmask 等专用参数并下发基础节点。连接效果或域名等隐私保护可能不同，请确认后使用。证书校验等其他设置不会因此改变。</span></div>\` })
+      html:\`<div class="alert">\${icon('warn')}<span>无法完整转换时，将省略 ECH、分片、finalmask\${nodes.some(n => n.type === 'tuic') ? '、TUIC 心跳 / UDP 中继 / 0-RTT / 禁用 SNI' : ''}等专用参数并下发基础节点。连接效果或域名等隐私保护可能不同，请确认后使用。证书校验等其他设置不会因此改变。</span></div>\` })
   } finally { parent.inert = wasInert }
 }
 
@@ -7455,7 +7592,7 @@ function ownCardInner(){
       <button class="ib" data-tip="复制分享链接" aria-label="复制分享链接" onclick="copyOwnLink(\${jsq(k)},this)">\${icon('link')}</button>
       <button class="ib" data-tip="编辑" aria-label="编辑" onclick="editOwn(\${jsq(k)})">\${icon('edit')}</button>
       <button class="ib dl" data-tip="删除" aria-label="删除" onclick="delOwn(\${jsq(k)})">\${icon('trash')}</button>
-    </div>\`).join('') || blankHTML('server', '还没有自有节点', '支持 VLESS、Hysteria2、Shadowsocks、VMess、AnyTLS，按协议编辑连接参数。')
+    </div>\`).join('') || blankHTML('server', '还没有自有节点', '支持 VLESS、Hysteria2、Shadowsocks、VMess、AnyTLS、TUIC v5，按协议编辑连接参数。')
   h += '</div>'
   const warnings = Object.entries((OWN && OWN.compatibility) || {}).flatMap(([k, items]) => items.map(w => ({...w, name: (ow[k] || {}).name || k})))
   const groups = new Map()
@@ -8612,9 +8749,10 @@ window.copyOwnLink = async (key, b) => {
   if (!link) {
     const basic = ((OWN && OWN.basicLinks) || {})[key]
     if (!basic) return toast(((OWN && OWN.linkErrors) || {})[key] || '这个节点生成不了分享链接，请检查节点配置。', true)
+    const tuic = ((OWN && OWN.own) || {})[key]?.type === 'tuic'
     if (!await modal({ title:'复制基础节点链接', ok:'复制基础链接',
       desc:'原节点的客户端专用参数会保留，不会从本站删除。',
-      html:\`<div class="alert">\${icon('warn')}<span>VLESS 的 ECH 配置会通过 ech 参数保留。无法表达的分片、finalmask、旧版 echForceQuery 等专用设置仍可能省略，连接效果或隐私保护可能不同。确认后复制可表达的节点配置，原参数不会删除。</span></div>\` })) return
+      html:\`<div class="alert">\${icon('warn')}<span>\${tuic ? 'TUIC 基础链接保留 UUID、密码、SNI、ALPN、拥塞控制及证书校验选项；通用链接无法表达的心跳、UDP 中继模式、0-RTT 和禁用 SNI 等设置将省略。' : 'VLESS 的 ECH 配置会通过 ech 参数保留。无法表达的分片、finalmask、旧版 echForceQuery 等专用设置仍可能省略，'}连接效果或隐私保护可能不同。确认后复制可表达的节点配置，原参数不会删除。</span></div>\` })) return
     link = basic
   }
   if (!await copyText(link)) return toast('复制失败', true)

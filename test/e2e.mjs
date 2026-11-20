@@ -247,6 +247,36 @@ try {
     const k = Object.keys(OWN.own).find(x => OWN.own[x].name === 'E2E-VLESS')
     delOwn(k); await __until(__top); await __ok(); await __until(() => document.querySelectorAll('.uplist.own .up').length === 3)
     return { '链接解析填表': filled, '保存后多一行': !!k, '删除后恢复': document.querySelectorAll('.uplist.own .up').length === 3 }`)
+  await step('TUIC：分享导入、独立密码和高级编辑保存', `const count=Object.keys(OWN.own).length
+    editOwn(null);await __until(__top);const form=__top(),uuid='11111111-2222-3333-4444-555555555555',password='synthetic:p@ss+/ %25#'
+    form.querySelector('#oimp').value='tuic://'+uuid+':'+encodeURIComponent(password)+'@safe.example:443?sni=tls.example&alpn=h3&congestion_control=bbr#TUIC-demo'
+    form.querySelector('#oimpb').click();await __until(()=>form.querySelector('#on').value==='TUIC-demo')
+    const passwordField=form.querySelector('#otuicpassword'),filled=passwordField&&passwordField.value===password&&form.querySelector('#ou').value===uuid&&form.querySelector('#ot').dataset.v==='tuic'
+    if(!filled){await __close();return {'TUIC解析填表且UUID密码分开':false}}
+    form.querySelector('#ownadvanced').open=true
+    const fields=!form.querySelector('#ftuic').hidden&&form.querySelector('#ffp').hidden&&form.querySelector('#ftransport').hidden
+    form.querySelector('#otuicheartbeat').value='1250'
+    form.querySelector('#otuicrelay .selb').click();document.querySelector('.selp.portal .selo[data-v="quic"]').click()
+    form.querySelector('#otuicrtt .selb').click();document.querySelector('.selp.portal .selo[data-v="1"]').click()
+    await __ok();await __until(()=>OWN&&Object.keys(OWN.own).length===count+1)
+    const key=Object.keys(OWN.own).find(k=>OWN.own[k].name==='TUIC-demo'),saved=key&&OWN.own[key].password===password&&OWN.own[key].heartbeatInterval===1250&&OWN.own[key].zeroRtt===true
+    editOwn(key);await __until(__top);const reopened=__top(),kept=reopened.querySelector('#otuicpassword').value===password&&reopened.querySelector('#otuicrelay').dataset.v==='quic'
+    reopened.querySelector('#ownjson').click();const json=await __until(()=>__top()!==reopened&&__top());const draft=JSON.parse(json.querySelector('#ownjsontext').value)
+    json.querySelector('[data-x]').click();await __until(()=>__top()===reopened);await __close()
+    const realCopy=copyText,copied=[];copyText=async text=>{copied.push(text);return true}
+    const button=document.querySelector('.uplist.own [onclick*="'+key+'"][aria-label="复制分享链接"]')
+    copyOwnLink(key,button);const notice=await __until(__top),explained=/TUIC/.test(notice.textContent)&&/UDP 中继/.test(notice.textContent)&&copied.length===0
+    notice.querySelector('[data-ok]').click();await __until(()=>copied.length===1);copyText=realCopy
+    const basic=new URL(copied[0]),shared=decodeURIComponent(basic.password)===password&&basic.searchParams.get('congestion_control')==='bbr'&&OWN.own[key].heartbeatInterval===1250
+    delOwn(key);await __until(__top);await __ok();await __until(()=>OWN&&!OWN.own[key])
+    return {'UUID密码分别填入':filled,'高级配置与QUIC字段正确显示':fields,'保存保留心跳与0RTT':saved,'重开和JSON编辑保留TUIC参数':kept&&draft.password===password&&draft.udpRelayMode==='quic','复制前说明TUIC参数省略范围':explained,'确认后复制基础链接而不删除原配置':shared}`)
+  await step('TUIC：Clash禁用SNI的实际证书风险在JSON填回时提醒', `editOwn(null);await __until(__top);const form=__top();form.querySelector('#ownjson').click()
+    const editor=await __until(()=>__top()!==form&&__top());editor.querySelector('#ownjsontext').value=JSON.stringify({name:'TUIC-risk',type:'tuic',server:'safe.example',port:443,uuid:'11111111-2222-3333-4444-555555555555',password:'synthetic-password','disable-sni':true,'skip-cert-verify':false})
+    editor.querySelector('[data-ok]').click();const warning=await __until(()=>__top()!==form&&__top()!==editor&&__top())
+    const warned=warning&&/中间人攻击/.test(warning.textContent)&&warning.querySelector('[data-ok]').textContent==='已了解'
+    if(warning){warning.querySelector('[data-ok]').click();await __until(()=>__top()===form&&!form.inert)}
+    const filled=form.querySelector('#ot').dataset.v==='tuic'&&form.querySelector('#oinsecure').checked&&form.querySelector('#otuicsni').dataset.v==='1'
+    await __close();return {'实际跳过校验不能绕过风险提示':!!warned,'填回保留独立禁用SNI和跳过校验状态':filled}`)
   await step('Reality导入：后量子能力字段经过JSON和表单保存不丢失', `const uuid='11111111-2222-3333-4444-555555555555',pk='A'.repeat(43),count=Object.keys(OWN.own).length
     editOwn(null);await __until(__top);const form=__top();form.querySelector('#ownjson').click();const editor=await __until(()=>__top()!==form&&__top())
     editor.querySelector('#ownjsontext').value='    - { name: Reality-PQ-demo, type: vless, server: safe.example, port: 25565, uuid: '+uuid+', udp: true, flow: xtls-rprx-vision, tls: true, skip-cert-verify: false, client-fingerprint: firefox, servername: tls.example, reality-opts: { public-key: '+pk+', short-id: 0592b9f3, support-x25519mlkem768: true } }'
@@ -288,9 +318,9 @@ try {
     const unchanged=input.value===text&&posts===0
     warning.querySelector('[data-ok]').click();const result=await pending;window.fetch=realFetch
     return {'输入保持原样且确认前不写入':unchanged,'整批只需一次确认并一次保存':posts===1&&result.count===2}`)
-  await step('配置自适应：13个协议格式示例均可直接解析', `const pending=ownJSONDialog();await __until(__top);const form=__top(),examples=[...form.querySelectorAll('#ownjsonexamples pre')]
+  await step('配置自适应：15个协议格式示例均可直接解析', `const pending=ownJSONDialog();await __until(__top);const form=__top(),examples=[...form.querySelectorAll('#ownjsonexamples pre')]
     const results=examples.map(e=>parseOwnJSON(e.textContent));const labels=form.querySelector('#ownjsonexamples').textContent
-    const result={'示例不是含糊的本站节点':!labels.includes('本站节点'),'13个真实组合齐全':examples.length===13,
+    const result={'示例不是含糊的本站节点':!labels.includes('本站节点'),'15个真实组合齐全':examples.length===15,
       '每个示例都能识别为一个节点':results.every(r=>r.ok&&r.nodes.length===1)}
     form.querySelector('[data-x]').click();await pending;return result`)
   await step('分享：保留专用参数仍可明确确认复制基础链接', `const key='copy-options-demo', advanced={name:'Copy-options',type:'anytls',s:'copy.example',p:443,u:'fictional',security:'tls',insecure:false,clientOptions:{singbox:{tls:{fragment:true,record_fragment:true}}}}
@@ -600,6 +630,20 @@ try {
       fs.writeFileSync(path.join(process.env.E2E_SCREENSHOT_DIR,name+'-insecure-warning.png'),Buffer.from(shot.data,'base64'))
     }
     await b.run(`__top().querySelector('[data-ok]').click();await window.__riskLayout`)
+    await b.run(`await __close()`)
+    await step(name+' TUIC 表单布局', `editOwn(null);await __until(__top);const form=__top()
+      form.querySelector('#ot .selb').click();document.querySelector('.selp.portal .selo[data-v="tuic"]').click();form.querySelector('#ownadvanced').open=true
+      await __until(()=>form.contains(document.activeElement)&&!document.querySelector('.bd.out'))
+      form.querySelector('#otuicheartbeat').focus();form.querySelector('#otuicheartbeat').scrollIntoView({block:'center'})
+      const r=form.getBoundingClientRect(),ct=form.querySelector('.ct'),controls=form.querySelector('#ftuic')
+      return {'TUIC表单不横向溢出':r.left>=0&&r.right<=innerWidth+1&&ct.scrollWidth<=ct.clientWidth+1&&controls.scrollWidth<=controls.clientWidth+1,
+        '密码独立且不显示TCP传输和指纹':!form.querySelector('#ftuicpassword').hidden&&form.querySelector('#ftransport').hidden&&form.querySelector('#ffp').hidden,
+        '默认不主动启用0RTT或跳过校验':form.querySelector('#otuicrtt').dataset.v===''&&!form.querySelector('#oinsecure').checked,
+        'ALPN默认h3且留空有明确提示':form.querySelector('#oalpn').value==='h3'&&/h3/.test(form.querySelector('#oalpn').placeholder)}`)
+    if(process.env.E2E_SCREENSHOT_DIR){
+      const shot=await b.send('Page.captureScreenshot',{format:'png'})
+      fs.writeFileSync(path.join(process.env.E2E_SCREENSHOT_DIR,name+'-tuic-editor.png'),Buffer.from(shot.data,'base64'))
+    }
     await b.run(`await __close()`)
     if (opt.mobile) await b.send('Emulation.setTouchEmulationEnabled', {enabled:false})
   }
